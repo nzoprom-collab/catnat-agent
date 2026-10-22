@@ -24,8 +24,14 @@ from llm import appeler_nemotron
 
 MODELE_LETTRE = "nvidia/nemotron-3-super-120b-a12b"
 A_COMPLETER = "[À COMPLÉTER]"
-NOMBRE_ESSAIS = 3
-MAX_PHRASES_DEGATS = 3
+NOMBRE_ESSAIS = 4
+MAX_MOTS_DEGATS = 60  # le détail objet par objet est dans l'annexe
+# Les 2 premiers essais se font sans la « réflexion » du modèle : réponse 10 fois moins chère, et le
+# code vérifie de toute façon chaque brouillon. Si le paragraphe des dégâts reste trop long, les essais
+# suivants se font avec réflexion (le modèle peut alors compter ses mots), avec une limite large pour
+# que la réponse ne soit pas coupée.
+ESSAIS_SANS_REFLEXION = 2
+SANS_REFLEXION = {"chat_template_kwargs": {"enable_thinking": False}}
 # Les 3 champs du JSON renvoyé par l'IA, dans l'ordre de la lettre
 CHAMPS_LETTRE = ["paragraphe_declaration", "paragraphe_degats", "paragraphe_demande"]
 
@@ -106,11 +112,15 @@ Réponds uniquement avec un objet JSON, sans texte avant ou après, qui contient
 {{"paragraphe_declaration": "...", "paragraphe_degats": "...", "paragraphe_demande": "..."}}
 
 - paragraphe_declaration : {paragraphe_1}
-- paragraphe_degats : au maximum {MAX_PHRASES_DEGATS} phrases courtes, avec un verbe, qui RÉSUMENT les
-   dégâts pièce par pièce (par exemple « Dans le salon, ... »). Reprends les dégâts fournis sans en
-   ajouter, sans les aggraver et sans inventer de lien de cause entre eux. Ne recopie pas la liste
-   telle quelle. Pour ceux marqués « probable, à confirmer », emploie une formulation prudente
-   (« semble »). Si un inventaire est joint en annexe, termine par UN SEUL renvoi à l'annexe.
+- paragraphe_degats : {MAX_MOTS_DEGATS} mots AU MAXIMUM, en deux ou trois phrases courtes. Un court résumé
+   par pièce, qui cite DEUX éléments AU PLUS, les plus importants (par exemple « Dans le salon, le sol
+   et les canapés sont couverts de boue. »). Ne cite pas tous les objets : ils sont dans l'annexe. Reprends les dégâts fournis sans
+   en ajouter, sans les aggraver et sans inventer de lien de cause entre eux. Pour ceux marqués
+   « probable, à confirmer », emploie une formulation prudente (« semble »). Si un inventaire est
+   joint en annexe, termine par UN SEUL renvoi à l'annexe, qui contient le détail.
+   Longueur attendue, sur l'exemple d'un AUTRE logement (ne le recopie pas) : « Dans le garage, le sol
+   et les cartons sont couverts de boue. Dans la chambre, le lit et la moquette sont détrempés, et le mur
+   semble taché. L'inventaire détaillé est joint en annexe. »
 - paragraphe_demande : « je » tiens les justificatifs à votre disposition (ne dresse pas leur liste),
    demande la prise en charge au titre de la garantie catastrophes naturelles et demande le passage
    d'un expert pour constater les dommages."""
@@ -153,7 +163,11 @@ def lire_reponse(reponse):
         # strict=False : accepte un vrai retour à la ligne à l'intérieur d'un champ
         donnees = json.loads(reponse[debut:fin + 1], strict=False) if debut != -1 else None
     except ValueError:
-        donnees = None
+        # Lecture de secours : un guillemet " non échappé dans un paragraphe casse le JSON ;
+        # on récupère alors chaque champ entre son nom et le nom du champ suivant.
+        motif = r'\s*,\s*'.join(rf'"{c}"\s*:\s*"(.*?)"' for c in CHAMPS_LETTRE) + r'\s*}'
+        trouve = re.search(motif, reponse, re.DOTALL)
+        donnees = dict(zip(CHAMPS_LETTRE, trouve.groups())) if trouve else None
     if not isinstance(donnees, dict):
         return None, "la réponse n'est pas un objet JSON valide"
     manquants = [c for c in CHAMPS_LETTRE if not isinstance(donnees.get(c), str) or not donnees[c].strip()]
@@ -164,8 +178,42 @@ def lire_reponse(reponse):
     return [p[0].upper() + p[1:] for p in paragraphes], None  # « je tiens... » -> « Je tiens... »
 
 
-def verifier_brouillon(paragraphes, description_degats, avec_arrete=True, avec_inventaire=False, une_seule_date=False):
-    """Renvoie la liste des problèmes des 3 paragraphes de l'IA (liste vide = brouillon accepté)."""
+def compter_mots(texte):
+    """Nombre de vrais mots : « l'eau » compte pour un mot, la ponctuation seule (« : », « ; », « – ») pour zéro."""
+    return len(re.findall(r"\w+(?:['’-]\w+)*", texte))
+
+
+def pieces_inventaire(inventaire):
+    """Les pièces de l'inventaire, dans l'ordre où elles apparaissent (sans les cases vides)."""
+    return list(dict.fromkeys(l["zone"] for l in inventaire or [] if l["zone"] and l["zone"] != A_COMPLETER))
+
+
+def resume_par_piece(inventaire):
+    """Les dégâts regroupés par pièce, pour que l'IA résume pièce par pièce au lieu de tout recopier."""
+    lignes = []
+    for piece in pieces_inventaire(inventaire) + ([A_COMPLETER] if any(l["zone"] == A_COMPLETER for l in inventaire) else []):
+        objets = [f"{l['objet']} ({l['dommage']}" + ("" if l["certitude"] == "certain" else ", probable, à confirmer") + ")"
+                  for l in inventaire if l["zone"] == piece]
+        lignes.append(f"- {piece} : " + " ; ".join(objets))
+    return "\n".join(lignes)
+
+
+def _consigne_longueur(inventaire):
+    """Budget de mots par pièce, rappelé dans la demande (le modèle le respecte mieux qu'une règle générale)."""
+    nombre = len(pieces_inventaire(inventaire))
+    if not nombre:
+        return f"Paragraphe des dégâts : {MAX_MOTS_DEGATS} mots au maximum.\n\n"
+    return (f"Paragraphe des dégâts : {nombre} pièce(s) à citer, {MAX_MOTS_DEGATS} mots au maximum en tout, "
+            f"soit {max(5, (MAX_MOTS_DEGATS - 12) // nombre - 3)} mots AU PLUS par pièce. Une seule courte phrase par pièce, "
+            f"qui cite DEUX éléments AU PLUS (les plus importants) : ne cite pas tous les objets.\n\n")
+
+
+def verifier_brouillon(paragraphes, description_degats, avec_arrete=True, avec_inventaire=False, une_seule_date=False,
+                       pieces=()):
+    """Renvoie la liste des problèmes des 3 paragraphes de l'IA (liste vide = brouillon accepté).
+
+    `pieces` : pièces de l'inventaire, qui doivent toutes être citées dans le paragraphe des dégâts.
+    """
     problemes = []
     # L'IA écrit parfois l'apostrophe typographique ’ : on la ramène à ' avant de comparer
     champs = {c: p.replace("’", "'") for c, p in zip(CHAMPS_LETTRE, paragraphes)}
@@ -182,9 +230,18 @@ def verifier_brouillon(paragraphes, description_degats, avec_arrete=True, avec_i
     degats = champs["paragraphe_degats"]
     if description_degats and simplifier(degats) == simplifier(description_degats):
         problemes.append("le paragraphe des dégâts recopie la description au lieu de la rédiger")
-    nombre_phrases = len(re.findall(r"[.!?](?:\s|$)", degats))
-    if nombre_phrases > MAX_PHRASES_DEGATS:
-        problemes.append(f"le paragraphe des dégâts fait {nombre_phrases} phrases (maximum {MAX_PHRASES_DEGATS})")
+    nombre_mots = compter_mots(degats)
+    if nombre_mots > MAX_MOTS_DEGATS:
+        # Consigne concrète, phrase par phrase : le modèle sait mieux raccourcir une phrase précise
+        phrases = [p.strip() for p in re.split(r"(?<=[.!?])\s+", degats) if p.strip()]
+        cible = max(5, (MAX_MOTS_DEGATS - 4) // max(1, len(phrases) - 1) - 2)
+        longues = [f"« {p} » ({compter_mots(p)} mots, vise {cible})" for p in phrases if compter_mots(p) > cible]
+        problemes.append(f"le paragraphe des dégâts fait {nombre_mots} mots (maximum {MAX_MOTS_DEGATS}) : "
+                         f"raccourcis ces phrases en gardant une vraie phrase avec un verbe : {' ; '.join(longues)}. "
+                         f"Termine simplement par « Détail en annexe. »")
+    oubliees = [p for p in pieces if simplifier(p) not in simplifier(degats)]
+    if oubliees:
+        problemes.append(f"pièces absentes du paragraphe des dégâts : {', '.join(oubliees)}")
     if avec_inventaire and (brouillon.lower().count("annexe") != 1 or "annexe" not in degats.lower()):
         problemes.append("il faut exactement un renvoi à l'annexe, dans paragraphe_degats")
     obligatoires = _obligatoires(une_seule_date)
@@ -213,7 +270,8 @@ def paragraphes_de_secours(avec_arrete, une_seule_date, description_sinistre, in
     """Les 3 paragraphes écrits entièrement par le code (modèle fixe), si l'IA échoue.
 
     Mêmes étiquettes que pour l'IA : le code les remplace ensuite par les vraies valeurs.
-    Les dégâts reprennent uniquement les mots du sinistré et les pièces de l'inventaire qu'il a relu.
+    Les dégâts : les pièces de l'inventaire relu par le sinistré (le détail est dans l'annexe) ;
+    sans inventaire, la description écrite par le sinistré lui-même.
     """
     declaration = f"Je déclare le sinistre subi à {{{{ADRESSE}}}}, causé par {{{{TYPE_CATASTROPHE}}}} " \
                   f"{_periode(une_seule_date)} à {{{{COMMUNE}}}}"
@@ -224,7 +282,7 @@ def paragraphes_de_secours(avec_arrete, une_seule_date, description_sinistre, in
                        "arrêté de catastrophe naturelle."
 
     phrases = []
-    description = _un_seul_paragraphe(description_sinistre or "")
+    description = "" if inventaire else _un_seul_paragraphe(description_sinistre or "")
     if description:
         if description[1:2].islower():  # « Eau et boue... » -> « eau et boue... » après les deux-points
             description = description[0].lower() + description[1:]
@@ -242,26 +300,49 @@ def paragraphes_de_secours(avec_arrete, une_seule_date, description_sinistre, in
     return [declaration, " ".join(phrases), demande]
 
 
-def checklist_pieces(arrete_calcule, reference_arrete):
-    """Liste des pièces à joindre ou à préparer (fixe, écrite par le code et non par l'IA)."""
+def checklist_pieces(arrete_calcule, avec_inventaire=False, langue="fr"):
+    """Pièces et démarches, en 3 blocs courts (écrits par le code, jamais par l'IA).
+
+    Renvoie {"enveloppe": [...], "garder": [...], "faire": [...]} : à mettre dans l'enveloppe,
+    à garder chez soi, à faire. `langue` : "fr" ou "en" (pour l'interface en anglais).
+    """
+    en = langue == "en"
+    enveloppe = ["Your letter, dated and signed" if en else "Votre lettre, datée et signée"]
+    if avec_inventaire:
+        enveloppe.append("Page 2: the list of your damage (add the value of each item if you know it)" if en else
+                         "La page 2 : la liste de vos dégâts (ajoutez la valeur des objets si vous la connaissez)")
     if arrete_calcule:
-        piece_arrete = (f"Copie de l'arrêté CatNat {reference_arrete}, publié au JO le "
-                        f"{_format(arrete_calcule['publication_jo'])} (à joindre, disponible sur legifrance.gouv.fr)")
-    else:
-        piece_arrete = ("Surveiller la publication de l'arrêté CatNat au Journal officiel (legifrance.gouv.fr) : "
-                        "la déclaration doit parvenir à l'assureur au plus tard 30 jours après cette publication")
-    return [
-        "Preuve de dépôt du recommandé et copie de cette lettre (à conserver)",
-        piece_arrete,
-        "Photos et vidéos des dégâts (si possible avant tout nettoyage)",
-        "Liste détaillée des biens endommagés, avec leur valeur estimée",
-        "Factures d'achat, garanties ou tout justificatif de la valeur des biens",
-        "Devis ou factures de réparation et de remplacement",
-        "Attestation d'un professionnel pour les équipements hors service",
-        "Conserver les biens endommagés jusqu'au passage de l'expert",
-        "Copie du contrat d'assurance habitation (conditions particulières)",
-        "RIB pour le versement de l'indemnisation",
+        jo = _format(arrete_calcule["publication_jo"])
+        enveloppe.append(f"A copy of the natural disaster decree of {jo} (print it from legifrance.gouv.fr)" if en else
+                         f"Une copie de l'arrêté de catastrophe naturelle du {jo} (à imprimer sur legifrance.gouv.fr)")
+    enveloppe += [
+        "Copies of a few photos of the damage" if en else "Des copies de quelques photos des dégâts",
+        "Your bank details (RIB), to be paid" if en else "Votre relevé d'identité bancaire (RIB), pour être remboursé",
     ]
+    garder = [
+        "The original photos and videos of the damage" if en else "Les photos et vidéos originales des dégâts",
+        "Invoices, quotes and warranties for your belongings" if en else "Les factures, devis et garanties de vos objets",
+        "The damaged items, until the expert's visit" if en else "Les objets abîmés, jusqu'à la visite de l'expert",
+        "The post office receipt for the registered letter, and a copy of your letter" if en else
+        "Le reçu de La Poste pour le recommandé, et une copie de votre lettre",
+    ]
+    if arrete_calcule and not arrete_calcule["depasse"]:
+        limite = _format(arrete_calcule["date_limite"])
+        faire = [f"Send the letter by registered post with acknowledgement of receipt, before {limite}" if en else
+                 f"Envoyer la lettre en recommandé avec accusé de réception, avant le {limite}"]
+    elif arrete_calcule:
+        faire = ["Send the letter by registered post with acknowledgement of receipt today, and call your insurer" if en
+                 else "Envoyer la lettre en recommandé avec accusé de réception aujourd'hui, et appeler votre assurance"]
+    else:
+        faire = [
+            "Send the letter by registered post with acknowledgement of receipt, right now" if en else
+            "Envoyer la lettre en recommandé avec accusé de réception, dès maintenant",
+            "Watch for the decree in the Journal officiel (legifrance.gouv.fr): your claim must reach your insurer "
+            "30 days after it at the latest" if en else
+            "Surveiller la publication de l'arrêté au Journal officiel (legifrance.gouv.fr) : votre déclaration "
+            "doit arriver chez l'assurance au plus tard 30 jours après",
+        ]
+    return {"enveloppe": enveloppe, "garder": garder, "faire": faire}
 
 
 def generer_lettre(arrete, sinistre, inventaire=None):
@@ -278,15 +359,15 @@ def generer_lettre(arrete, sinistre, inventaire=None):
     Ne lève jamais d'erreur à cause de l'IA : dans le pire des cas, c'est la lettre de secours.
     """
     # Import ici pour que lettre.py fonctionne aussi sans photos
-    from photos import inventaire_en_description, inventaire_en_tableau
+    from photos import inventaire_en_tableau
 
     avec_arrete = arrete is not None
     calcul = calculer_delai_declaration(arrete) if avec_arrete else None
     description = sinistre.get("description_degats") or ""
     if inventaire:
         description = (description + "\n" if description else "") + (
-            "Dommages constatés sur photos (l'inventaire détaillé est joint en annexe) :\n"
-            + inventaire_en_description(inventaire)
+            "Dommages constatés sur photos, regroupés par pièce (l'inventaire détaillé est joint en annexe) :\n"
+            + resume_par_piece(inventaire)
         )
     reference = _valeur(arrete.get("code_national_catnat")) if avec_arrete else A_COMPLETER
 
@@ -322,7 +403,7 @@ def generer_lettre(arrete, sinistre, inventaire=None):
     une_seule_date = valeurs["DATE_DEBUT"] == valeurs["DATE_FIN"]
     messages = [
         {"role": "system", "content": _consignes(avec_arrete, une_seule_date)},
-        {"role": "user", "content": f"Dégâts à décrire :\n{_valeur(description)}"},
+        {"role": "user", "content": _consigne_longueur(inventaire) + f"Dégâts à résumer :\n{_valeur(description)}"},
     ]
     tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     rejets = []  # raisons pour lesquelles un brouillon a été refusé
@@ -330,9 +411,9 @@ def generer_lettre(arrete, sinistre, inventaire=None):
 
     for essais in range(1, NOMBRE_ESSAIS + 1):
         try:
-            reponse, tokens_appel = appeler_nemotron(
-                messages, modele=MODELE_LETTRE, temperature=0.3, max_tokens=6000
-            )
+            options = ({"max_tokens": 2000, "extra_body": SANS_REFLEXION} if essais <= ESSAIS_SANS_REFLEXION
+                       else {"max_tokens": 12000})
+            reponse, tokens_appel = appeler_nemotron(messages, modele=MODELE_LETTRE, temperature=0.3, **options)
         except Exception as erreur:  # IA indisponible, budget de tokens épuisé... : lettre de secours
             rejets.append(f"appel à l'IA impossible : {erreur}")
             break
@@ -340,7 +421,7 @@ def generer_lettre(arrete, sinistre, inventaire=None):
             tokens[cle] += tokens_appel[cle]
         paragraphes, probleme = lire_reponse(reponse)
         problemes = [probleme] if probleme else verifier_brouillon(
-            paragraphes, description, avec_arrete, bool(inventaire), une_seule_date)
+            paragraphes, description, avec_arrete, bool(inventaire), une_seule_date, pieces_inventaire(inventaire))
         if not problemes:
             break
         paragraphes = None
@@ -387,12 +468,7 @@ def generer_lettre(arrete, sinistre, inventaire=None):
     for etiquette, valeur in valeurs.items():
         lettre = lettre.replace("{{" + etiquette + "}}", valeur)
 
-    checklist = checklist_pieces(calcul, reference)
-    if inventaire:
-        checklist += [
-            "Photos originales des dégâts, numérotées comme dans l'inventaire en annexe",
-            "Colonne « valeur estimée » de l'inventaire à compléter, ligne par ligne",
-        ]
+    checklist = checklist_pieces(calcul, bool(inventaire))
 
     return {
         "lettre": lettre,
@@ -428,9 +504,10 @@ if __name__ == "__main__":
     print("=" * 70)
     print(resultat["lettre"])
     print("=" * 70)
-    print("\nPièces à joindre / à préparer :")
-    for piece in resultat["checklist"]:
-        print(f"  [ ] {piece}")
+    for bloc, pieces in resultat["checklist"].items():
+        print(f"\n{bloc} :")
+        for piece in pieces:
+            print(f"  [ ] {piece}")
     for numero, raison in enumerate(resultat["rejets"], start=1):
         print(f"\nBrouillon n°{numero} refusé par la vérification : {raison}")
     if resultat["secours"]:

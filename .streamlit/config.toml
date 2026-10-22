@@ -5,8 +5,12 @@ backgroundColor = "#ffffff"
 secondaryBackgroundColor = "#f4f6f9"
 textColor = "#1f2933"
 font = "sans serif"
+baseFontSize = 18  # texte de base en 18 px : lisible pour tous
 
 [server]
+# Pas de navigateur ouvert automatiquement, et pas de pop-up « Help agents write better apps »
+# (Streamlit l'affiche en local quand un assistant de code est détecté)
+headless = true
 maxUploadSize = 15  # Mo par photo
 
 [browser]

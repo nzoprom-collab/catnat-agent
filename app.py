@@ -2,12 +2,18 @@
 
 Lancer :  .venv/bin/streamlit run app.py
 
+Public visé : une personne âgée, stressée, peu à l'aise avec l'informatique, souvent sur téléphone.
+D'où : gros textes, une seule action principale par écran, aucun jargon, aucune info technique
+visible (elles sont rangées dans le panneau « Comment ça marche ? » en bas de page).
+
 Confidentialité : rien de personnel n'est écrit sur le disque. Les photos et les informations du
 sinistré restent en mémoire, dans la session du navigateur, et disparaissent à la fermeture de la page.
-Seuls des résultats publics (arrêtés Géorisques, recherches web) sont mis en cache.
+Seuls des résultats publics (arrêtés Géorisques, recherches web, photos de démo) sont mis en cache.
 """
 
+import base64
 import html
+import io
 from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -15,9 +21,10 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 import streamlit as st
+from PIL import Image, ImageOps
 
 from catnat import GEO_API, _format, calculer_delai_declaration, recuperer_arretes_catnat
-from lettre import MODELE_LETTRE, NOTE_ANNEXE, SEPARATEUR_ANNEXE, TITRE_ANNEXE, A_COMPLETER, generer_lettre
+from lettre import A_COMPLETER, MODELE_LETTRE, SEPARATEUR_ANNEXE, checklist_pieces, generer_lettre
 from llm import LimiteTokensAtteinte
 from pdf import lettre_en_pdf
 from photos import CERTAIN, MODELE_VISION, PROBABLE, analyser_photos
@@ -27,9 +34,10 @@ from radar import (AUTRE_SITE, MODELE_RADAR, NON_OFFICIEL, OFFICIEL_LOCAL, PRESS
 DOSSIER = Path(__file__).parent
 PHOTOS_DEMO = sorted((DOSSIER / "exemples").glob("photo*.jpg"))
 URL_DEPOT = "https://github.com/nzoprom-collab/catnat-agent"
-LIMITES = {"analyses": 3, "lettres": 2, "photos": 6}  # par session, pour protéger la démo publique
+LIMITES = {"analyses": 3, "lettres": 2, "photos": 6}  # par visite, pour protéger la démo publique
+TAILLE_MINIATURE = 240  # pixels : assez pour reconnaître la photo, léger sur téléphone
 
-# Données FICTIVES pré-remplies par le bouton « Essayer la démo »
+# Données FICTIVES pré-remplies par le bouton « Voir un exemple »
 DEMO = {
     "saisie_commune": "Martigues",
     "saisie_dep": "13",
@@ -43,6 +51,12 @@ DEMO = {
     "f_debut": date(2026, 10, 20),
     "f_fin": None,
 }
+# Champs saisis par l'utilisateur, conservés quand il change d'étape (voir garder_saisies)
+SAISIES = {"saisie_commune": "", "saisie_dep": "", "description": "", "f_nom": "", "f_adresse": "",
+           "f_assureur": "", "f_adresse_assureur": "", "f_contrat": "", "f_type": None, "f_debut": None, "f_fin": None}
+# Types d'événements proposés dans la liste (on peut aussi écrire le sien) : ils restent en français, comme la lettre
+TYPES_EVENEMENT = ["Inondations et coulées de boue", "Inondations par remontées de nappe phréatique",
+                   "Mouvements de terrain", "Sécheresse", "Tempête", "Grêle", "Submersion marine"]
 
 # ---------------------------------------------------------------------------------------------
 # Textes de l'interface (français / anglais). La lettre, elle, est toujours en français.
@@ -50,283 +64,469 @@ DEMO = {
 TEXTES = {
     "fr": {
         "slogan": "Ne ratez plus jamais votre délai de déclaration",
-        "demo": "✨ Essayer la démo (Martigues + 3 photos)",
-        "demo_aide": "Pré-remplit une commune réelle (Martigues, 13) et 3 photos d'exemple. Le sinistré est fictif.",
-        "confidentialite": "🔒 **Confidentialité** : vos photos et informations personnelles ne sont jamais enregistrées sur le serveur. "
-                           "Elles restent en mémoire le temps de votre visite et disparaissent quand vous fermez la page. "
-                           "Les photos sont transmises à l'IA (Nebius) uniquement pour être analysées.",
-        "avertissement": "⚖️ Outil d'aide : il ne remplace pas un conseil juridique. Vérifiez toujours votre contrat et contactez votre assureur.",
-        "etapes": ["Ma commune", "Mes dégâts", "Ma lettre"],
-        "etape_n": "Étape {n} sur 3 · {nom}",
-        "commune": "Commune",
-        "departement": "Département",
-        "departement_aide": "Numéro du département (ex. 13). Facultatif, mais utile si plusieurs communes portent le même nom.",
-        "choisir_commune": "Suggestions (geo.api.gouv.fr)",
-        "aucune_commune": "Aucune commune trouvée. Vérifiez l'orthographe ou le département.",
+        "demo": "✨ Voir un exemple (démo)",
+        "demo_aide": "Remplit tout avec un exemple : une vraie commune (Martigues) et 3 photos. La personne est fictive.",
+        "etapes": ["Votre commune", "Vos dégâts", "Votre lettre"],
+        "etape_n": "Étape {n} sur 3 : {nom}",
+        # Étape 1
+        "intro_1": "Nous vérifions si l'état de catastrophe naturelle est reconnu dans votre commune, "
+                   "et jusqu'à quand vous pouvez prévenir votre assurance.",
+        "commune": "Nom de votre commune",
+        "departement": "Département (facultatif)",
+        "departement_aide": "Le numéro de votre département, par exemple 13. Utile si plusieurs communes portent le même nom.",
+        "choisir_commune": "Choisissez votre commune dans la liste",
+        "aucune_commune": "Nous ne trouvons pas cette commune. Vérifiez l'orthographe.",
         "erreur_geo": "La recherche de communes ne répond pas pour l'instant. Réessayez dans un instant.",
-        "analyser": "🔍 Analyser ma commune",
-        "analyse_en_cours": "Analyse en cours : arrêtés officiels, actualité, puis classement par l'IA (≈ 30 s)…",
-        "cas": "Cas {cas}",
-        "libelles": {
-            "A": "Arrêté officiel publié : délai de déclaration en cours",
-            "B": "Arrêté annoncé dans l'actualité, pas encore dans la base officielle",
-            "C": "Demande de reconnaissance en cours, pas encore d'arrêté",
-            "E": "Arrêté publié, délai de déclaration dépassé",
-            "D": "Aucune procédure récente détectée",
+        "analyser": "Voir la situation de ma commune",
+        "choisir_d_abord": "Tapez le nom de votre commune, puis choisissez-la dans la liste.",
+        "analyse_en_cours": "Nous consultons les sites officiels et l'actualité… (environ 30 secondes)",
+        "q_situation": "Que se passe-t-il dans ma commune ?",
+        "q_faire": "Que dois-je faire ?",
+        "q_date": "Avant quelle date ?",
+        "statuts": {
+            "A": "✅ Catastrophe naturelle reconnue",
+            "B": "📰 Reconnaissance annoncée, pas encore confirmée",
+            "C": "⏳ Demande de reconnaissance en cours",
+            "E": "⚠️ Reconnue, mais le délai est dépassé",
+            "D": "ℹ️ Aucune démarche en cours",
         },
-        "jours_restants": "jours pour déclarer vos dégâts",
-        "jour_restant": "jour pour déclarer vos dégâts",
-        "avant_le": "Date limite prudente : <b>{date}</b> (publication au Journal officiel + 29 jours)",
-        "depasse_le": "La date limite était le <b>{date}</b>",
-        "explication_ia": "🤖 Explication rédigée par l'IA",
-        "verifications": "🛡️ Vérifications faites par le code",
-        "corrections": "Le code a corrigé le classement de l'IA :",
-        "rejetees": "Affirmations de l'IA rejetées :",
-        "aucune_correction": "Aucune correction : le classement de l'IA est cohérent avec les données et les sources vérifiées.",
-        "info_depasse": "ℹ️ Autre arrêté pour cette commune : « {type} », publié au JO le {jo}. Son délai de déclaration a expiré le {limite}.",
-        "sources": "Sources",
+        "situation": {
+            "A": "L'État a reconnu l'état de catastrophe naturelle à {commune} ({type}). "
+                 "La décision est parue au Journal officiel le {jo}.",
+            "B": "Des articles récents annoncent que l'État a reconnu la catastrophe naturelle à {commune}. "
+                 "Ce n'est pas encore confirmé par le site officiel Géorisques.",
+            "C": "La mairie de {commune} a demandé à l'État de reconnaître l'état de catastrophe naturelle. "
+                 "La décision n'est pas encore publiée.",
+            "E": "L'État a reconnu l'état de catastrophe naturelle à {commune} ({type}). "
+                 "La décision est parue au Journal officiel le {jo}, il y a plus de 30 jours.",
+            "D": "Nous n'avons trouvé aucune démarche récente de reconnaissance de catastrophe naturelle à {commune}.",
+        },
+        "faire": {
+            "A": "Prévenez votre assurance par lettre recommandée avec accusé de réception. Nous vous aidons à l'écrire.",
+            "B": "Prévenez votre assurance dès maintenant par lettre recommandée, sans attendre la confirmation "
+                 "officielle. Nous vous aidons à l'écrire.",
+            "C": "N'attendez pas la décision : prévenez votre assurance dès maintenant par lettre recommandée, "
+                 "et signalez vos dégâts à votre mairie. Nous vous aidons à écrire la lettre.",
+            "E": "Appelez votre assurance tout de suite et expliquez votre situation. Envoyez quand même "
+                 "votre lettre recommandée : nous vous aidons à l'écrire.",
+            "D": "Si vous avez des dégâts, prévenez quand même votre assurance et votre mairie : "
+                 "la mairie peut demander la reconnaissance à l'État.",
+        },
+        "date": {
+            "A": "Avant le {limite}",
+            "B": "Le plus vite possible",
+            "C": "Dès maintenant",
+            "E": "Aujourd'hui",
+            "D": "Le plus vite possible",
+        },
+        "date_detail": {
+            "A": "La loi vous donne 30 jours après la parution au Journal officiel. Nous gardons 1 jour de marge.",
+            "B": "Le délai de 30 jours a peut-être déjà commencé : la date de parution se vérifie sur legifrance.gouv.fr.",
+            "C": "Quand la décision paraîtra au Journal officiel, vous aurez 30 jours au maximum.",
+            "E": "La date limite était le {limite}.",
+            "D": "Si une reconnaissance paraît un jour au Journal officiel, vous aurez 30 jours après sa parution.",
+        },
+        "compte": "Il vous reste <b>{n}</b> jours",
+        "compte_1": "C'est le <b>dernier jour</b>",
+        "info_depasse": "Pour information : un autre arrêté de catastrophe naturelle (« {type} ») est paru au "
+                        "Journal officiel le {jo}. Son délai s'est terminé le {limite}.",
+        "pourquoi": "🔎 Pourquoi on vous dit ça ? (sources)",
+        "resume_ia": "Résumé rédigé par l'IA, à partir des sources ci-dessous :",
         "sources_fr": "",
-        "badges": {"Géorisques": "Géorisques · officiel", OFFICIEL_LOCAL: "officiel local", PRESSE: "presse",
-                   RESEAU_SOCIAL: "réseau social", AUTRE_SITE: "autre site"},
-        "a_verifier": "non officiel, à vérifier",
+        "voir_source": "voir la source",
+        "georisques": "Géorisques, site officiel de l'État",
+        "badges": {"Géorisques": "Officiel", OFFICIEL_LOCAL: "Site public local", PRESSE: "Presse",
+                   RESEAU_SOCIAL: "Réseau social", AUTRE_SITE: "Autre site"},
+        "a_verifier": "À vérifier",
         "continuer_degats": "Continuer : mes dégâts →",
         "continuer_lettre": "Continuer : ma lettre →",
-        "retour": "← Retour",
-        "photos_demo_info": "📸 Démo : 3 photos d'exemple libres de droits (inondations aux États-Unis). Vous pouvez aussi envoyer les vôtres.",
-        "credits_photos": "Crédits : B137 (CC0), King Prince (CC BY 2.0), Infrogmation (CC BY 2.5), via Wikimedia Commons. [Détails]({url}/blob/main/exemples/CREDITS.md)",
+        "retour": "← Revenir à l'étape précédente",
+        # Étape 2
+        "intro_2": "Ajoutez des photos de vos dégâts. L'IA fait la liste de ce qu'elle voit, puis vous vérifiez chaque élément.",
+        "prive": "🔒 Vos photos ne sont pas enregistrées : elles disparaissent quand vous fermez la page.",
+        "photos_demo_info": "📸 Exemple : 3 photos d'inondation libres de droits.",
+        "credits_photos": "Photos : B137 (CC0), King Prince (CC BY 2.0), Infrogmation (CC BY 2.5), Wikimedia Commons.",
         "utiliser_mes_photos": "Utiliser mes propres photos",
-        "ajouter_photos": "Ajoutez des photos de vos dégâts (6 maximum)",
-        "aide_photos": "JPG, PNG ou WEBP. Photos restantes pour cette session : {n}.",
+        "ajouter_photos": "Choisissez vos photos (6 au maximum)",
+        "aide_photos": "Photos encore possibles pendant cette visite : {n}.",
         "description": "Décrivez vos dégâts avec vos mots (facultatif)",
-        "description_exemple": "Ex. : l'eau est montée de 50 cm dans le salon, la chaudière ne fonctionne plus…",
-        "analyser_photos": "🔍 Analyser mes {n} photo(s)",
-        "analyse_photos_en_cours": "L'IA regarde vos photos une par une (≈ 20 s par photo)…",
-        "trop_de_photos": "6 photos maximum à la fois.",
-        "inventaire": "Inventaire des dommages",
-        "inventaire_aide": "Relisez chaque ligne : corrigez, supprimez (case à gauche puis 🗑️) ou ajoutez une ligne (en bas du tableau). "
-                           "Remplissez la valeur estimée si vous la connaissez.",
-        "photos_numeros": "Numéros des photos : {liste}",
-        "lignes_rejetees": "{n} ligne(s) proposée(s) par l'IA rejetée(s) par le code (champ manquant, prix, numéro de photo invalide…).",
-        "inventaire_manuel": "✍️ Saisir l'inventaire à la main",
-        "colonnes": {"photo": "Photo", "zone": "Pièce", "objet": "Objet", "dommage": "Dommage constaté",
-                     "certitude": "Certitude", "valeur": "Valeur estimée (€)"},
-        "relu": "✅ J'ai relu l'inventaire",
-        "relu_ok": "Inventaire validé : {n} ligne(s).",
-        "modifs_non_validees": "Vous avez modifié l'inventaire : cliquez à nouveau sur « J'ai relu l'inventaire ».",
-        "relire_obligatoire": "Relisez l'inventaire et cliquez sur « J'ai relu l'inventaire » pour continuer.",
-        "rien_a_declarer": "Ajoutez des photos, une description ou une ligne d'inventaire pour continuer.",
-        "lettre_avec_arrete": "📄 La lettre citera l'arrêté officiel **{ref}**, publié au Journal officiel le **{jo}**.",
-        "lettre_sans_arrete": "📄 Aucun arrêté n'est encore publié : la lettre déclare vos dégâts **dès maintenant**, sans attendre. "
-                              "Indiquez le type d'événement et sa date.",
+        "description_exemple": "Par exemple : l'eau est montée de 50 cm dans le salon, la chaudière ne marche plus…",
+        "analyser_photos": "Analyser mes photos ({n})",
+        "sans_photos": "Je n'ai pas de photos",
+        "analyse_photos_en_cours": "L'IA regarde vos photos une par une… (environ 20 secondes par photo)",
+        "trop_de_photos": "6 photos au maximum. Retirez-en quelques-unes.",
+        "verifier_titre": "Vérifiez la liste de vos dégâts",
+        "verifier_aide": "Pour chaque dégât, appuyez sur « Correct », « Modifier » ou « Supprimer ».",
+        "verifies": "Vérifiés : <b>{n} sur {total}</b>",
+        "tout_verifie": "Tout est vérifié. Vous pouvez continuer.",
+        "liste_vide": "Aucun dégât dans la liste pour l'instant. Ajoutez-en un, ou décrivez vos dégâts plus bas.",
+        "onglet_liste": "📋 Liste",
+        "onglet_tableau": "🧮 Vue tableau",
+        "correct": "✅ Correct",
+        "modifier": "✏️ Modifier",
+        "supprimer": "🗑️ Supprimer",
+        "verifie": "✓ Vérifié",
+        "a_confirmer": "À confirmer par l'expert",
+        "photo_n": "Photo {n}",
+        "sans_photo": "Ajouté par vous",
+        "valeur_txt": "Valeur : {v}",
+        "supprime": "Dégât supprimé : « {objet} ».",
+        "annuler_suppression": "↩️ Annuler la suppression",
+        "ajouter": "➕ Ajouter un dégât oublié",
+        "champ_zone": "Pièce (par exemple : salon)",
+        "champ_objet": "Objet ou partie du logement",
+        "champ_dommage": "Dégât constaté",
+        "champ_valeur": "Valeur estimée en euros (facultatif)",
+        "champ_valeur_aide": "Laissez vide si vous ne savez pas : la lettre indiquera [À COMPLÉTER].",
+        "champ_incertain": "Je ne suis pas sûr : à confirmer par l'expert",
+        "enregistrer": "Enregistrer",
+        "annuler": "Annuler",
+        "objet_obligatoire": "Indiquez au moins l'objet abîmé.",
+        "tableau_aide": "Pour ceux qui préfèrent un tableau : modifiez les cases, ajoutez une ligne en bas, "
+                        "ou cochez une ligne puis 🗑️ pour la supprimer. Cliquez ensuite sur « Enregistrer le tableau ».",
+        "enregistrer_tableau": "Enregistrer le tableau (j'ai tout vérifié)",
+        "colonnes": {"photo": "Photo", "zone": "Pièce", "objet": "Objet", "dommage": "Dégât constaté",
+                     "certitude": "Certitude", "valeur": "Valeur (€)"},
+        "rien_a_declarer": "Ajoutez des photos, un dégât ou une description pour continuer.",
+        "reste_a_verifier": "Vérifiez chaque dégât de la liste pour continuer.",
+        # Étape 3
+        "intro_3": "Remplissez vos informations : nous préparons votre lettre à l'assurance, prête à imprimer.",
+        "lettre_avec_arrete": "📄 Votre lettre citera la décision officielle (arrêté de catastrophe naturelle) "
+                              "parue au Journal officiel le **{jo}**.",
+        "lettre_sans_arrete": "📄 Aucune décision n'est encore publiée : votre lettre déclare vos dégâts **dès maintenant**. "
+                              "Indiquez le type de catastrophe et sa date.",
         "lettre_en_francais": "",
-        "alerte_depasse": "⚠️ Le délai légal est dépassé. Contactez votre assureur immédiatement en expliquant votre situation.",
-        "nom": "Nom et prénom",
-        "adresse": "Adresse du logement sinistré",
-        "assureur": "Assureur",
-        "adresse_assureur": "Adresse de l'assureur",
+        "alerte_depasse": "⚠️ Le délai est dépassé : appelez aussi votre assurance aujourd'hui.",
+        "nom": "Vos nom et prénom",
+        "adresse": "Adresse du logement abîmé",
+        "assureur": "Nom de votre assurance",
+        "adresse_assureur": "Adresse de votre assurance",
         "contrat": "Numéro de contrat",
-        "type_evenement": "Type d'événement",
-        "type_exemple": "Ex. : inondations et coulées de boue",
-        "date_debut": "Date de l'événement (début)",
-        "date_fin": "Date de fin (facultatif)",
-        "vide_a_completer": "Un champ vide apparaîtra comme [À COMPLÉTER] dans la lettre.",
-        "generer": "✍️ Générer ma lettre",
-        "generation": "L'IA rédige le corps de la lettre, le code vérifie et insère les faits (≈ 30 s)…",
-        "apercu": "Aperçu de la lettre",
-        "telecharger": "⬇️ Télécharger la lettre (PDF)",
-        "a_envoyer": "À envoyer en **lettre recommandée avec accusé de réception**, après relecture.",
-        "checklist": "Pièces à joindre ou à préparer",
-        "checklist_fr": "",
-        "brouillons_refuses": "{n} brouillon(s) de l'IA refusé(s) par le code avant la version finale.",
-        "version_simplifiee": "ℹ️ Version simplifiée : cette lettre a été rédigée à partir d'un modèle fixe. Relisez-la et complétez-la si besoin.",
-        "cout": "Coût de cette étape : {tokens} tokens",
-        "limite_analyses": "Limite atteinte : 3 analyses de commune par session (démo publique). Revenez plus tard.",
-        "limite_lettres": "Limite atteinte : 2 lettres par session (démo publique). Revenez plus tard.",
-        "limite_photos": "Limite atteinte : 6 photos par session (démo publique). Il vous en reste {n}.",
-        "limite_tokens": "Le budget global d'IA de cette démo est épuisé (garde-fou anti-dépense). Merci de votre compréhension.",
-        "erreur_technique": "Un problème technique est survenu : {detail}. Réessayez dans un instant.",
+        "aide_contrat": "Vous le trouverez sur votre contrat ou sur votre dernier avis d'échéance.",
+        "type_evenement": "Type de catastrophe",
+        "type_choisir": "Choisissez dans la liste ou écrivez",
+        "date_debut": "Date de la catastrophe (premier jour)",
+        "date_fin": "Dernier jour (si cela a duré plusieurs jours)",
+        "vide_a_completer": "Si vous ne connaissez pas une information, laissez la case vide : "
+                            "la lettre indiquera [À COMPLÉTER] et vous l'écrirez à la main.",
+        "generer": "Préparer ma lettre",
+        "generation": "Nous préparons votre lettre… (environ 30 secondes)",
+        "lettre_prete": "✅ Votre lettre est prête.",
+        "telecharger": "⬇️ Télécharger ma lettre (PDF)",
+        "a_envoyer": "Imprimez-la, relisez-la, signez-la, puis envoyez-la **en recommandé avec accusé de réception** "
+                     "(au guichet de La Poste).",
+        "version_simplifiee": "Version simplifiée : cette lettre a été rédigée à partir d'un modèle fixe. Relisez-la bien.",
+        "lire_lettre": "📄 Lire ma lettre avant de l'imprimer",
+        "page_2": "Page 2 : la liste de vos {n} dégâts, avec une colonne « valeur » à compléter.",
+        "modifier_infos": "✏️ Modifier mes informations",
+        "blocs": {"enveloppe": "✉️ À mettre dans l'enveloppe", "garder": "🏠 À garder chez vous", "faire": "✅ À faire"},
+        # Messages
+        "limite_analyses": "Pour protéger ce service gratuit, chaque visite est limitée à 3 recherches de commune. "
+                           "Revenez plus tard.",
+        "limite_lettres": "Pour protéger ce service gratuit, chaque visite est limitée à 2 lettres. Revenez plus tard.",
+        "limite_photos": "Pour protéger ce service gratuit, chaque visite est limitée à 6 photos. Il vous en reste {n}.",
+        "limite_tokens": "Ce service gratuit a atteint sa limite d'utilisation. Merci de revenir plus tard.",
+        "erreur_technique": "Le service ne répond pas pour l'instant. Réessayez dans quelques minutes.",
+        # Bas de page
         "comment": "🧭 Comment ça marche ?",
         "comment_code": "#### 🧮 Fait par le code (fiable, vérifiable)",
         "comment_code_liste": [
-            "**Faits officiels** : arrêtés de catastrophe naturelle (API Géorisques), communes (geo.api.gouv.fr)",
-            "**Dates et délais** : date limite prudente = publication au Journal officiel + 29 jours (la loi accorde 30 jours, art. L125-2 du Code des assurances)",
-            "**Vérification des sources web** : URL réellement trouvée, citation présente mot pour mot, niveau du site, nom de la commune",
-            "**Dernier mot sur le cas** A/B/C/E/D, et tous les **conseils** affichés",
-            "**Lettre** : en-tête, objet, dates, références, insérés par le code ; le brouillon de l'IA est refusé s'il invente un chiffre ou une date",
-            "**Garde-fous** : budget de tokens, limites par session",
+            "**Faits officiels** : arrêtés de catastrophe naturelle (Géorisques), communes (geo.api.gouv.fr)",
+            "**Dates limites** : parution au Journal officiel + 29 jours (la loi accorde 30 jours, article L125-2 du Code des assurances)",
+            "**Vérification des sources web** : page réellement trouvée, citation présente mot pour mot, type de site, nom de la commune",
+            "**Dernier mot sur la situation** de la commune, et **tous les conseils** affichés",
+            "**Lettre** : en-tête, objet, dates et références écrits par le code ; un brouillon de l'IA est refusé s'il invente un chiffre ou une date, ou si le paragraphe des dégâts dépasse 60 mots",
+            "**Garde-fous** : budget de tokens, limites par visite",
         ],
         "comment_ia": "#### 🤖 Fait par l'IA (NVIDIA Nemotron, via Nebius)",
         "comment_ia_liste": [
-            "**Classement de la situation** à partir des arrêtés et de l'actualité : `{radar}`",
-            "**Lecture des photos** et inventaire des dommages visibles : `{vision}`",
+            "**Analyse de la situation** à partir des arrêtés et de l'actualité : `{radar}`",
+            "**Lecture des photos** et liste des dégâts visibles : `{vision}`",
             "**Rédaction du corps de la lettre**, avec des étiquettes que le code remplit : `{lettre}`",
-            "**Recherche web** : Tavily (2 recherches par commune, mises en cache 24 h)",
+            "**Recherche web** : Tavily (2 recherches par commune, gardées 24 h en mémoire)",
         ],
         "comment_regle": "**Règle d'or** : l'IA n'invente jamais un fait. Elle rédige et classe ; le code fournit et vérifie les faits.",
-        "session": "Ma session",
-        "restant": "Analyses : {a}/3 · Lettres : {l}/2 · Photos : {p}/6",
-        "effacer": "🧹 Effacer mes données et recommencer",
+        "technique": "#### 🔧 Détails techniques de votre visite",
+        "tech_cas": "Situation retenue par le code : cas **{cas}** ({libelle})",
+        "tech_tokens": "Tokens consommés : commune {radar} · photos {photos} · lettre {lettre}",
+        "tech_corrections": "Corrections du code sur l'analyse de l'IA :",
+        "tech_aucune_correction": "Aucune correction : l'analyse de l'IA est cohérente avec les données et les sources vérifiées.",
+        "tech_rejetees": "Affirmations de l'IA rejetées par le code :",
+        "tech_lignes_rejetees": "Lignes de l'inventaire photo rejetées par le code : {n}",
+        "tech_brouillons": "Brouillons de lettre refusés par le code : {n} · lettre de secours : {secours}",
+        "tech_erreurs": "Erreurs techniques :",
+        "oui": "oui", "non": "non",
+        "session": "Pendant cette visite : {a} recherche(s) sur 3 · {l} lettre(s) sur 2 · {p} photo(s) sur 6.",
+        "effacer": "🧹 Effacer mes informations et recommencer",
+        "confidentialite": "🔒 Rien n'est enregistré sur notre serveur : vos photos et informations restent le temps "
+                           "de votre visite. Les photos sont envoyées à l'IA (Nebius) uniquement pour être analysées.",
+        "avertissement": "⚖️ Outil d'aide : il ne remplace pas un conseil juridique. Vérifiez votre contrat et contactez votre assurance.",
         "pied": "Prototype réalisé pour le hackathon Nebius x NVIDIA · NVIDIA Nemotron · Tavily · données Géorisques et geo.api.gouv.fr",
         "code_source": "code source",
     },
     "en": {
         "slogan": "Never miss your disaster claim deadline",
-        "demo": "✨ Try the demo (Martigues + 3 photos)",
-        "demo_aide": "Pre-fills a real town (Martigues, 13) and 3 sample photos. The policyholder is fictitious.",
-        "confidentialite": "🔒 **Privacy**: your photos and personal details are never stored on the server. "
-                           "They stay in memory during your visit and disappear when you close the page. "
-                           "Photos are sent to the AI (Nebius) only to be analysed.",
-        "avertissement": "⚖️ Assistance tool: it does not replace legal advice. Always check your policy and contact your insurer.",
-        "etapes": ["My town", "My damage", "My letter"],
-        "etape_n": "Step {n} of 3 · {nom}",
-        "commune": "Town (commune)",
-        "departement": "Département",
-        "departement_aide": "French département number (e.g. 13). Optional, but useful when several towns share a name.",
-        "choisir_commune": "Suggestions (geo.api.gouv.fr)",
-        "aucune_commune": "No town found. Check the spelling or the département.",
+        "demo": "✨ See an example (demo)",
+        "demo_aide": "Fills everything with an example: a real town (Martigues) and 3 photos. The person is fictitious.",
+        "etapes": ["Your town", "Your damage", "Your letter"],
+        "etape_n": "Step {n} of 3: {nom}",
+        "intro_1": "We check whether a natural disaster has been officially recognised in your town, "
+                   "and until when you can notify your insurer.",
+        "commune": "Name of your town (commune)",
+        "departement": "Département (optional)",
+        "departement_aide": "Your French département number, for example 13. Useful when several towns share a name.",
+        "choisir_commune": "Choose your town from the list",
+        "aucune_commune": "We cannot find this town. Please check the spelling.",
         "erreur_geo": "The town search is not responding right now. Please try again in a moment.",
-        "analyser": "🔍 Analyse my town",
-        "analyse_en_cours": "Analysing: official decrees, news, then AI classification (≈ 30 s)…",
-        "cas": "Case {cas}",
-        "libelles": {
-            "A": "Official decree published: claim deadline still open",
-            "B": "Decree announced in the news, not yet in the official database",
-            "C": "Recognition request in progress, no decree yet",
-            "E": "Decree published, claim deadline has passed",
-            "D": "No recent procedure detected",
+        "analyser": "See the situation in my town",
+        "choisir_d_abord": "Type the name of your town, then choose it from the list.",
+        "analyse_en_cours": "We are checking official websites and the news… (about 30 seconds)",
+        "q_situation": "What is happening in my town?",
+        "q_faire": "What should I do?",
+        "q_date": "By when?",
+        "statuts": {
+            "A": "✅ Natural disaster officially recognised",
+            "B": "📰 Recognition announced, not yet confirmed",
+            "C": "⏳ Recognition request in progress",
+            "E": "⚠️ Recognised, but the deadline has passed",
+            "D": "ℹ️ No procedure in progress",
         },
-        "jours_restants": "days left to report your damage",
-        "jour_restant": "day left to report your damage",
-        "avant_le": "Safe deadline: <b>{date}</b> (publication in the Official Journal + 29 days)",
-        "depasse_le": "The deadline was <b>{date}</b>",
-        "explication_ia": "🤖 Explanation written by the AI (in French)",
-        "verifications": "🛡️ Checks performed by the code",
-        "corrections": "The code corrected the AI's classification:",
-        "rejetees": "AI statements rejected:",
-        "aucune_correction": "No correction: the AI's classification is consistent with the data and the verified sources.",
-        "info_depasse": "ℹ️ Another decree for this town: “{type}”, published in the Official Journal on {jo}. Its claim deadline expired on {limite}.",
-        "sources": "Sources",
-        "sources_fr": "Sources and quotes are shown in their original language (French).",
-        "badges": {"Géorisques": "Géorisques · official", OFFICIEL_LOCAL: "local official", PRESSE: "press",
-                   RESEAU_SOCIAL: "social media", AUTRE_SITE: "other site"},
-        "a_verifier": "unofficial, to be checked",
+        "situation": {
+            "A": "The French State has officially recognised a natural disaster in {commune} ({type}). "
+                 "The decision was published in the Official Journal on {jo}.",
+            "B": "Recent articles say the French State has recognised a natural disaster in {commune}. "
+                 "This is not yet confirmed by the official Géorisques website.",
+            "C": "The town hall of {commune} has asked the French State to recognise a natural disaster. "
+                 "The decision has not been published yet.",
+            "E": "The French State has officially recognised a natural disaster in {commune} ({type}). "
+                 "The decision was published in the Official Journal on {jo}, more than 30 days ago.",
+            "D": "We found no recent request for natural disaster recognition in {commune}.",
+        },
+        "faire": {
+            "A": "Notify your insurer by registered letter with acknowledgement of receipt. We help you write it.",
+            "B": "Notify your insurer right now by registered letter, without waiting for official confirmation. "
+                 "We help you write it.",
+            "C": "Don't wait for the decision: notify your insurer right now by registered letter, and report "
+                 "your damage to your town hall. We help you write the letter.",
+            "E": "Call your insurer right away and explain your situation. Send your registered letter anyway: "
+                 "we help you write it.",
+            "D": "If you have damage, notify your insurer and your town hall anyway: the town hall can ask "
+                 "the State for recognition.",
+        },
+        "date": {"A": "Before {limite}", "B": "As soon as possible", "C": "Right now", "E": "Today",
+                 "D": "As soon as possible"},
+        "date_detail": {
+            "A": "The law gives you 30 days after publication in the Official Journal. We keep 1 day of margin.",
+            "B": "The 30-day period may have already started: the publication date can be checked on legifrance.gouv.fr.",
+            "C": "When the decision is published in the Official Journal, you will have 30 days at most.",
+            "E": "The deadline was {limite}.",
+            "D": "If a recognition is ever published in the Official Journal, you will have 30 days after it.",
+        },
+        "compte": "<b>{n}</b> days left",
+        "compte_1": "This is the <b>last day</b>",
+        "info_depasse": "For your information: another natural disaster decree (“{type}”) was published in the "
+                        "Official Journal on {jo}. Its deadline ended on {limite}.",
+        "pourquoi": "🔎 Why are we telling you this? (sources)",
+        "resume_ia": "Summary written by the AI, based on the sources below (in French):",
+        "sources_fr": "The sources are French websites: their texts are shown in French.",
+        "voir_source": "see the source",
+        "georisques": "Géorisques, official French government website",
+        "badges": {"Géorisques": "Official", OFFICIEL_LOCAL: "Local public website", PRESSE: "Press",
+                   RESEAU_SOCIAL: "Social media", AUTRE_SITE: "Other website"},
+        "a_verifier": "To be checked",
         "continuer_degats": "Next: my damage →",
         "continuer_lettre": "Next: my letter →",
-        "retour": "← Back",
-        "photos_demo_info": "📸 Demo: 3 royalty-free sample photos (floods in the United States). You can also upload your own.",
-        "credits_photos": "Credits: B137 (CC0), King Prince (CC BY 2.0), Infrogmation (CC BY 2.5), via Wikimedia Commons. [Details]({url}/blob/main/exemples/CREDITS.md)",
+        "retour": "← Back to the previous step",
+        "intro_2": "Add photos of your damage. The AI lists what it sees, then you check each item.",
+        "prive": "🔒 Your photos are not stored: they disappear when you close the page.",
+        "photos_demo_info": "📸 Example: 3 royalty-free photos of floods.",
+        "credits_photos": "Photos: B137 (CC0), King Prince (CC BY 2.0), Infrogmation (CC BY 2.5), Wikimedia Commons.",
         "utiliser_mes_photos": "Use my own photos",
-        "ajouter_photos": "Add photos of your damage (6 maximum)",
-        "aide_photos": "JPG, PNG or WEBP. Photos left for this session: {n}.",
-        "description": "Describe your damage in your own words (optional, French preferred)",
-        "description_exemple": "E.g.: the water rose 50 cm in the living room, the boiler no longer works…",
-        "analyser_photos": "🔍 Analyse my {n} photo(s)",
-        "analyse_photos_en_cours": "The AI is looking at your photos one by one (≈ 20 s per photo)…",
-        "trop_de_photos": "6 photos maximum at a time.",
-        "inventaire": "Damage inventory",
-        "inventaire_aide": "Review each line: correct it, delete it (tick the left box, then 🗑️) or add a line (bottom of the table). "
-                           "Fill in the estimated value if you know it. The inventory stays in French for your insurer.",
-        "photos_numeros": "Photo numbers: {liste}",
-        "lignes_rejetees": "{n} line(s) suggested by the AI rejected by the code (missing field, price, invalid photo number…).",
-        "inventaire_manuel": "✍️ Enter the inventory manually",
+        "ajouter_photos": "Choose your photos (6 maximum)",
+        "aide_photos": "Photos still allowed during this visit: {n}.",
+        "description": "Describe your damage in your own words (optional, French if possible)",
+        "description_exemple": "For example: the water rose 50 cm in the living room, the boiler no longer works…",
+        "analyser_photos": "Analyse my photos ({n})",
+        "sans_photos": "I have no photos",
+        "analyse_photos_en_cours": "The AI is looking at your photos one by one… (about 20 seconds per photo)",
+        "trop_de_photos": "6 photos maximum. Please remove some.",
+        "verifier_titre": "Check the list of your damage",
+        "verifier_aide": "For each item, tap “Correct”, “Edit” or “Delete”. The list stays in French for your insurer.",
+        "verifies": "Checked: <b>{n} of {total}</b>",
+        "tout_verifie": "Everything is checked. You can continue.",
+        "liste_vide": "No damage in the list yet. Add one, or describe your damage below.",
+        "onglet_liste": "📋 List",
+        "onglet_tableau": "🧮 Table view",
+        "correct": "✅ Correct",
+        "modifier": "✏️ Edit",
+        "supprimer": "🗑️ Delete",
+        "verifie": "✓ Checked",
+        "a_confirmer": "To be confirmed by the expert",
+        "photo_n": "Photo {n}",
+        "sans_photo": "Added by you",
+        "valeur_txt": "Value: {v}",
+        "supprime": "Item deleted: “{objet}”.",
+        "annuler_suppression": "↩️ Undo",
+        "ajouter": "➕ Add a forgotten item",
+        "champ_zone": "Room (for example: salon)",
+        "champ_objet": "Item or part of the home",
+        "champ_dommage": "Damage observed",
+        "champ_valeur": "Estimated value in euros (optional)",
+        "champ_valeur_aide": "Leave empty if you don't know: the letter will show [À COMPLÉTER] (to be completed).",
+        "champ_incertain": "I'm not sure: to be confirmed by the expert",
+        "enregistrer": "Save",
+        "annuler": "Cancel",
+        "objet_obligatoire": "Please enter at least the damaged item.",
+        "tableau_aide": "For those who prefer a table: edit the cells, add a row at the bottom, or tick a row "
+                        "then 🗑️ to delete it. Then click “Save the table”.",
+        "enregistrer_tableau": "Save the table (I have checked everything)",
         "colonnes": {"photo": "Photo", "zone": "Room", "objet": "Item", "dommage": "Damage observed",
-                     "certitude": "Certainty", "valeur": "Estimated value (€)"},
-        "relu": "✅ I have reviewed the inventory",
-        "relu_ok": "Inventory confirmed: {n} line(s).",
-        "modifs_non_validees": "You changed the inventory: click “I have reviewed the inventory” again.",
-        "relire_obligatoire": "Review the inventory and click “I have reviewed the inventory” to continue.",
-        "rien_a_declarer": "Add photos, a description or an inventory line to continue.",
-        "lettre_avec_arrete": "📄 The letter will cite the official decree **{ref}**, published in the Official Journal on **{jo}**.",
-        "lettre_sans_arrete": "📄 No decree has been published yet: the letter reports your damage **right now**, without waiting. "
-                              "Enter the type of event and its date.",
-        "lettre_en_francais": "🇫🇷 Your letter is always written **in French**: it is addressed to a French insurer, under French insurance law (Code des assurances).",
-        "alerte_depasse": "⚠️ The legal deadline has passed. Contact your insurer immediately and explain your situation.",
-        "nom": "Full name",
+                     "certitude": "Certainty", "valeur": "Value (€)"},
+        "rien_a_declarer": "Add photos, an item or a description to continue.",
+        "reste_a_verifier": "Check each item of the list to continue.",
+        "intro_3": "Fill in your details: we prepare your letter to your insurer, ready to print.",
+        "lettre_avec_arrete": "📄 Your letter will cite the official decision (natural disaster decree) "
+                              "published in the Official Journal on **{jo}**.",
+        "lettre_sans_arrete": "📄 No decision has been published yet: your letter reports your damage **right now**. "
+                              "Enter the type of disaster and its date.",
+        "lettre_en_francais": "🇫🇷 Your letter is written **in French**: it goes to a French insurer, under French insurance law.",
+        "alerte_depasse": "⚠️ The deadline has passed: also call your insurer today.",
+        "nom": "Your full name",
         "adresse": "Address of the damaged home",
-        "assureur": "Insurer",
-        "adresse_assureur": "Insurer's address",
+        "assureur": "Name of your insurer",
+        "adresse_assureur": "Address of your insurer",
         "contrat": "Policy number",
-        "type_evenement": "Type of event (in French)",
-        "type_exemple": "E.g.: inondations et coulées de boue",
-        "date_debut": "Date of the event (start)",
-        "date_fin": "End date (optional)",
-        "vide_a_completer": "Empty fields will appear as [À COMPLÉTER] (to be completed) in the letter.",
-        "generer": "✍️ Generate my letter",
-        "generation": "The AI drafts the body of the letter, the code checks it and inserts the facts (≈ 30 s)…",
-        "apercu": "Letter preview",
-        "telecharger": "⬇️ Download the letter (PDF)",
-        "a_envoyer": "Send it by **registered letter with acknowledgement of receipt**, after reviewing it.",
-        "checklist": "Documents to attach or prepare",
-        "checklist_fr": "In French, as your insurer will expect.",
-        "brouillons_refuses": "{n} AI draft(s) rejected by the code before the final version.",
-        "version_simplifiee": "ℹ️ Simplified version: this letter was written from a fixed template. Review it and complete it if needed.",
-        "cout": "Cost of this step: {tokens} tokens",
-        "limite_analyses": "Limit reached: 3 town analyses per session (public demo). Please come back later.",
-        "limite_lettres": "Limit reached: 2 letters per session (public demo). Please come back later.",
-        "limite_photos": "Limit reached: 6 photos per session (public demo). You have {n} left.",
-        "limite_tokens": "The demo's global AI budget is used up (spending safeguard). Thank you for your understanding.",
-        "erreur_technique": "A technical problem occurred: {detail}. Please try again in a moment.",
+        "aide_contrat": "You will find it on your policy or on your last premium notice.",
+        "type_evenement": "Type of disaster (in French)",
+        "type_choisir": "Choose from the list or type",
+        "date_debut": "Date of the disaster (first day)",
+        "date_fin": "Last day (if it lasted several days)",
+        "vide_a_completer": "If you don't know something, leave it empty: the letter will show [À COMPLÉTER] "
+                            "(to be completed) and you can write it by hand.",
+        "generer": "Prepare my letter",
+        "generation": "We are preparing your letter… (about 30 seconds)",
+        "lettre_prete": "✅ Your letter is ready.",
+        "telecharger": "⬇️ Download my letter (PDF)",
+        "a_envoyer": "Print it, read it, sign it, then send it **by registered post with acknowledgement of receipt** "
+                     "(at the post office counter).",
+        "version_simplifiee": "Simplified version: this letter was written from a fixed template. Read it carefully.",
+        "lire_lettre": "📄 Read my letter before printing it (in French)",
+        "page_2": "Page 2: the list of your {n} damaged items, with a “value” column to complete.",
+        "modifier_infos": "✏️ Change my details",
+        "blocs": {"enveloppe": "✉️ To put in the envelope", "garder": "🏠 To keep at home", "faire": "✅ To do"},
+        "limite_analyses": "To protect this free service, each visit is limited to 3 town searches. Please come back later.",
+        "limite_lettres": "To protect this free service, each visit is limited to 2 letters. Please come back later.",
+        "limite_photos": "To protect this free service, each visit is limited to 6 photos. You have {n} left.",
+        "limite_tokens": "This free service has reached its usage limit. Please come back later.",
+        "erreur_technique": "The service is not responding right now. Please try again in a few minutes.",
         "comment": "🧭 How it works",
         "comment_code": "#### 🧮 Done by the code (reliable, verifiable)",
         "comment_code_liste": [
-            "**Official facts**: natural disaster decrees (Géorisques API), towns (geo.api.gouv.fr)",
-            "**Dates and deadlines**: safe deadline = publication in the Official Journal + 29 days (the law allows 30 days, art. L125-2 of the French Insurance Code)",
-            "**Web source checks**: URL actually found, quote present word for word, site reliability level, town name",
-            "**Final say on the case** A/B/C/E/D, and every piece of **advice** shown",
-            "**Letter**: header, subject, dates, references inserted by the code; an AI draft is rejected if it invents a number or a date",
-            "**Safeguards**: token budget, per-session limits",
+            "**Official facts**: natural disaster decrees (Géorisques), towns (geo.api.gouv.fr)",
+            "**Deadlines**: publication in the Official Journal + 29 days (the law allows 30 days, art. L125-2 of the French Insurance Code)",
+            "**Web source checks**: page actually found, quote present word for word, type of website, town name",
+            "**Final say on the town's situation**, and **every piece of advice** shown",
+            "**Letter**: header, subject, dates and references written by the code; an AI draft is rejected if it invents a number or a date, or if the damage paragraph exceeds 60 words",
+            "**Safeguards**: token budget, per-visit limits",
         ],
         "comment_ia": "#### 🤖 Done by the AI (NVIDIA Nemotron, via Nebius)",
         "comment_ia_liste": [
-            "**Classifying the situation** from decrees and news: `{radar}`",
+            "**Analysing the situation** from decrees and news: `{radar}`",
             "**Reading the photos** and listing visible damage: `{vision}`",
             "**Drafting the body of the letter**, with placeholders filled by the code: `{lettre}`",
-            "**Web search**: Tavily (2 searches per town, cached for 24 h)",
+            "**Web search**: Tavily (2 searches per town, kept 24 h in memory)",
         ],
         "comment_regle": "**Golden rule**: the AI never invents a fact. It drafts and classifies; the code provides and checks the facts.",
-        "session": "My session",
-        "restant": "Analyses: {a}/3 · Letters: {l}/2 · Photos: {p}/6",
-        "effacer": "🧹 Delete my data and start over",
+        "technique": "#### 🔧 Technical details of your visit",
+        "tech_cas": "Situation retained by the code: case **{cas}** ({libelle})",
+        "tech_tokens": "Tokens used: town {radar} · photos {photos} · letter {lettre}",
+        "tech_corrections": "Corrections made by the code to the AI's analysis:",
+        "tech_aucune_correction": "No correction: the AI's analysis is consistent with the data and the verified sources.",
+        "tech_rejetees": "AI statements rejected by the code:",
+        "tech_lignes_rejetees": "Photo inventory lines rejected by the code: {n}",
+        "tech_brouillons": "Letter drafts rejected by the code: {n} · fallback letter: {secours}",
+        "tech_erreurs": "Technical errors:",
+        "oui": "yes", "non": "no",
+        "session": "During this visit: {a} search(es) of 3 · {l} letter(s) of 2 · {p} photo(s) of 6.",
+        "effacer": "🧹 Delete my details and start over",
+        "confidentialite": "🔒 Nothing is stored on our server: your photos and details are kept only during your "
+                           "visit. Photos are sent to the AI (Nebius) only to be analysed.",
+        "avertissement": "⚖️ Assistance tool: it does not replace legal advice. Check your policy and contact your insurer.",
         "pied": "Prototype built for the Nebius x NVIDIA hackathon · NVIDIA Nemotron · Tavily · data from Géorisques and geo.api.gouv.fr",
         "code_source": "source code",
     },
 }
 
-# Couleurs des cartes (une par cas) et des badges de source
-COULEURS_CAS = {"A": "#1b7f4b", "B": "#1f5fa8", "C": "#c25e00", "E": "#b42318", "D": "#5f6b7a"}
+# Couleurs des cartes (une par situation) et des badges de source : contraste suffisant sur fond clair
+COULEURS_CAS = {"A": "#14713f", "B": "#1f5fa8", "C": "#a84e00", "E": "#b42318", "D": "#4a5563"}
 COULEURS_BADGES = {"Géorisques": "#0b6e4f", OFFICIEL_LOCAL: "#1f5fa8", PRESSE: "#6941c6",
-                   RESEAU_SOCIAL: "#c25e00", AUTRE_SITE: "#5f6b7a"}
+                   RESEAU_SOCIAL: "#a84e00", AUTRE_SITE: "#4a5563"}
 
 CSS = """
 <style>
-.block-container {max-width: 860px; padding-top: 2rem;}
-h1.titre {font-size: 2.3rem; margin: 0; letter-spacing: -0.02em;}
-p.slogan {color: #52606d; font-size: 1.05rem; margin-top: .2rem;}
-.etapes {display: flex; gap: .4rem; flex-wrap: wrap; margin: .3rem 0 .6rem;}
-.etape {padding: .25rem .75rem; border-radius: 999px; font-size: .85rem; background: #eef1f5; color: #52606d;}
-.etape.active {background: #1f5fa8; color: white; font-weight: 600;}
-.etape.faite {background: #e3f1ea; color: #1b7f4b;}
-.carte {border-radius: 16px; padding: 1.2rem 1.4rem; border-left: 8px solid; margin: .8rem 0 1rem; background: #f7f9fb;}
-.carte .cas {font-size: .8rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;}
-.carte .libelle {font-size: 1.25rem; font-weight: 700; margin: .2rem 0 .6rem; color: #1f2933;}
-.carte .compte {font-size: 5rem; font-weight: 800; line-height: 1;}
-.carte .compte-texte {font-size: 1.05rem; font-weight: 600; margin-bottom: .4rem;}
-.carte .conseil {font-size: 1.02rem; color: #1f2933; margin-top: .6rem;}
-.badge {display: inline-block; padding: .12rem .6rem; border-radius: 999px; color: white; font-size: .72rem;
-        font-weight: 600; margin: 0 .35rem .25rem 0; white-space: nowrap;}
-.badge.contour {background: white !important; border: 1px solid #c3cad3; color: #52606d;}
-.source {padding: .7rem .9rem; border: 1px solid #e4e7eb; border-radius: 12px; margin: .45rem 0; background: white;}
-.source .texte {margin: .25rem 0; color: #1f2933;}
-.source .citation {color: #52606d; font-style: italic; font-size: .9rem;}
-.source a {font-size: .85rem; word-break: break-all;}
-.lettre {white-space: pre-wrap; font-family: Georgia, "Times New Roman", serif; background: white; color: #1f2933;
-         border: 1px solid #e4e7eb; border-radius: 12px; padding: 1.6rem; line-height: 1.55; font-size: .95rem;
-         box-shadow: 0 2px 10px rgba(15, 23, 42, .06);}
-.pied {color: #7b8794; font-size: .8rem; text-align: center; margin-top: 2.5rem;}
+.block-container {max-width: 780px; padding-top: 1.2rem; padding-bottom: 3rem;}
+p, li, label, input, textarea, .stMarkdown {font-size: 1rem;}
+.marque {display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; margin: 0;}
+.marque .nom {font-size: 1.5rem; font-weight: 800; color: #1f2933;}
+.marque .slogan {font-size: 1rem; color: #3e4c59;}
+h2.etape {font-size: 1.9rem; font-weight: 800; line-height: 1.2; color: #1f2933; margin: .6rem 0 .3rem; padding: 0;}
+.intro {font-size: 1.05rem; color: #1f2933; margin-bottom: .6rem;}
+[data-testid="stWidgetLabel"] p {font-size: 1.05rem !important; font-weight: 600; color: #1f2933;}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {color: #3e4c59 !important; font-size: .95rem !important;}
+.stButton button, .stDownloadButton button, .stFormSubmitButton button {
+  min-height: 3.1rem; font-size: 1.05rem !important; font-weight: 600; border-radius: 12px;}
+.stButton button p, .stDownloadButton button p, .stFormSubmitButton button p {font-size: 1.05rem !important;}
+[data-testid="stBaseButton-primary"] {min-height: 3.6rem; font-size: 1.2rem !important;}
+[data-testid="stBaseButton-primary"] p {font-size: 1.2rem !important; font-weight: 700;}
+[data-testid="stExpander"] summary p {font-size: 1.05rem !important; font-weight: 600;}
+.carte {border-radius: 16px; padding: 1.1rem 1.3rem; border: 2px solid; border-left-width: 10px; margin: .8rem 0 1rem;}
+.carte .statut {font-size: 1.45rem; font-weight: 800; margin-bottom: .7rem; color: #1f2933;}
+.carte .question {font-size: .95rem; font-weight: 700; margin-top: .8rem; text-transform: none;}
+.carte .reponse {font-size: 1.1rem; color: #1f2933; line-height: 1.45;}
+.carte .date {font-size: 2rem; font-weight: 800; line-height: 1.15;}
+.carte .compte {font-size: 1.3rem; color: #1f2933; margin-top: .2rem;}
+.carte .compte b {font-size: 3rem; font-weight: 800;}
+.carte .detail {font-size: .95rem; color: #3e4c59; margin-top: .3rem;}
+.badge {display: inline-block; padding: .1rem .6rem; border-radius: 999px; color: white; font-size: .8rem;
+        font-weight: 700; margin: 0 .35rem .3rem 0; white-space: nowrap;}
+.badge.contour {background: white !important; border: 1.5px solid #4a5563; color: #1f2933;}
+.source {padding: .8rem 1rem; border: 1px solid #c3cad3; border-radius: 12px; margin: .5rem 0; background: white;}
+.source .site {font-weight: 700; color: #1f2933; margin-right: .4rem;}
+.source .texte {margin: .3rem 0; color: #1f2933;}
+.source .citation {color: #3e4c59; font-style: italic; font-size: .95rem; margin-bottom: .3rem;}
+[class*="st-key-carte_"] {border: 2px solid #c3cad3; border-radius: 14px; padding: .75rem; background: white;
+                           margin-top: .4rem;}
+[class*="st-key-carte_"][class*="_ok"] {border-color: #14713f; background: #f1f8f4;}
+[class*="st-key-ok_"] button {background: #14713f !important; border-color: #14713f !important;}
+[class*="st-key-ok_"] button p {color: white !important;}
+.dommage {display: flex; gap: .9rem; align-items: flex-start;}
+.note {color: #3e4c59; font-size: .95rem; line-height: 1.5; margin: .2rem 0 .7rem;}
+.soustitre {font-size: 1.35rem; font-weight: 800; color: #1f2933; margin: 1rem 0 .3rem;}
+.vignettes {display: flex; gap: .5rem; margin: .4rem 0;}
+.vignettes figure {margin: 0; flex: 1; text-align: center; font-size: .9rem; color: #3e4c59;}
+.vignettes img {width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px;}
+.dommage img {width: 96px; height: 96px; object-fit: cover; border-radius: 10px; flex-shrink: 0;}
+.dommage .vide {width: 96px; height: 96px; border-radius: 10px; flex-shrink: 0; background: #eef1f5;
+                display: flex; align-items: center; justify-content: center; font-size: 2rem;}
+.dommage .phrase {font-size: 1.08rem; color: #1f2933; line-height: 1.4;}
+.dommage .phrase b {font-weight: 700;}
+.dommage .infos {font-size: .9rem; color: #3e4c59; margin-top: .25rem;}
+.dommage .ok {color: #14713f; font-weight: 700;}
+.dommage .incertain {color: #a84e00; font-weight: 700;}
+.piece {font-size: 1.25rem; font-weight: 800; color: #1f2933; margin: 1.2rem 0 0;}
+.compteur {font-size: 1.1rem; margin: .3rem 0 .2rem;}
+.lettre {font-family: Georgia, "Times New Roman", serif; background: white; color: #1f2933;
+         border: 1px solid #c3cad3; border-radius: 12px; padding: 1.3rem; line-height: 1.55; font-size: .95rem;}
+.pied {color: #3e4c59; font-size: .9rem; text-align: center; margin-top: 1rem; line-height: 1.6;}
 @media (max-width: 640px) {
-  h1.titre {font-size: 1.8rem;}
-  .carte .compte {font-size: 3.6rem;}
-  .lettre {padding: 1rem; font-size: .88rem;}
+  .block-container {padding-left: 1rem; padding-right: 1rem;}
+  h2.etape {font-size: 1.55rem;}
+  .carte {padding: .9rem 1rem;}
+  .carte .date {font-size: 1.7rem;}
+  .dommage img, .dommage .vide {width: 72px; height: 72px;}
+  [class*="st-key-carte_"] .stButton button {min-height: 2.8rem; padding: .3rem .7rem;}
+  [class*="st-key-carte_"] .stButton button p {font-size: .95rem !important;}
+  .lettre {padding: .9rem; font-size: .88rem;}
 }
 </style>
 """
@@ -344,16 +544,27 @@ def t(cle, **valeurs):
 def initialiser_session():
     defauts = {
         "langue": "fr", "etape": 1, "commune": None, "radar": None, "demo_photos": False,
-        "inventaire_df": None, "inventaire_photos": [], "inventaire_rejetees": 0, "inventaire_valide": None,
-        "resultat_lettre": None, "inventaire_lettre": None, "tokens_photos": 0,
+        "dommages": None, "miniatures": [], "prochain_id": 1, "edition": None, "ajout": False,
+        "supprime": None, "version_tableau": 0, "resultat_lettre": None,
         "compteurs": {"analyses": 0, "lettres": 0, "photos": 0},
+        "tech": {"radar": None, "photos": None, "lettre": None, "lignes_rejetees": 0, "erreurs": []},
     }
-    for cle, valeur in defauts.items():
+    for cle, valeur in {**defauts, **SAISIES}.items():
         st.session_state.setdefault(cle, valeur)
 
 
+def garder_saisies():
+    """Streamlit oublie la valeur d'un champ qui n'est plus affiché (quand on change d'étape).
+
+    Réaffecter chaque valeur au début de la page la conserve : les infos saisies à l'étape 3
+    sont encore là si l'on revient à l'étape 2, puis à l'étape 3.
+    """
+    for cle in SAISIES:
+        st.session_state[cle] = st.session_state[cle]
+
+
 def effacer_donnees():
-    """Efface tout ce qui est personnel (les compteurs de la session sont conservés)."""
+    """Efface tout ce qui est personnel (les compteurs de la visite sont conservés)."""
     compteurs, langue = st.session_state.compteurs, st.session_state.langue
     for cle in list(st.session_state.keys()):
         del st.session_state[cle]
@@ -361,13 +572,11 @@ def effacer_donnees():
 
 
 def lancer_demo():
-    """Bouton « Essayer la démo » : pré-remplit Martigues, les 3 photos et un sinistré fictif."""
-    for cle in ("choix_commune", "editeur_inventaire"):
-        st.session_state.pop(cle, None)
-    for cle, valeur in DEMO.items():
-        st.session_state[cle] = valeur
-    st.session_state.update(etape=1, demo_photos=True, lancer_analyse=True, radar=None, inventaire_df=None,
-                            inventaire_valide=None, resultat_lettre=None)
+    """Bouton « Voir un exemple » : pré-remplit Martigues, les 3 photos et une personne fictive."""
+    st.session_state.pop("choix_commune", None)
+    st.session_state.update(DEMO)
+    st.session_state.update(etape=1, demo_photos=True, lancer_analyse=True, radar=None, dommages=None,
+                            miniatures=[], edition=None, ajout=False, supprime=None, resultat_lettre=None)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -394,6 +603,24 @@ def inventaire_demo():
     return analyser_photos(PHOTOS_DEMO)
 
 
+def miniature(source):
+    """Petite version JPEG d'une photo (chemin ou fichier envoyé), gardée en mémoire seulement."""
+    if hasattr(source, "seek"):
+        source.seek(0)
+    with Image.open(source) as image:
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        image.thumbnail((TAILLE_MINIATURE, TAILLE_MINIATURE))
+        tampon = io.BytesIO()
+        image.save(tampon, format="JPEG", quality=80)
+    return tampon.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def miniature_demo(chemin):
+    """Miniature d'une photo de démo (publique, donc mise en cache)."""
+    return miniature(chemin)
+
+
 def trier_arretes(arretes):
     """Renvoie (arrêtés au délai en cours, arrêtés des 12 derniers mois au délai dépassé), chacun (brut, calcul)."""
     en_cours, depasses = [], []
@@ -409,169 +636,299 @@ def trier_arretes(arretes):
     return en_cours, depasses
 
 
-def conseil(cas, resultat, en_cours):
-    """Conseil écrit par le code (français : celui de radar.py ; anglais : sa traduction)."""
-    if st.session_state.langue == "fr":
-        return resultat["conseil"]
-    if cas == "A":
-        c = en_cours[0][1]
-        return (f"Report your damage to your insurer by registered letter with acknowledgement of receipt "
-                f"before {_format(c['date_limite'])} ({c['jours_restants']} days left).")
-    return {
-        "B": "A decree seems to have been published (unofficial, check on legifrance.gouv.fr). The claim deadline "
-             "starts on publication in the Official Journal: report your damage to your insurer now, without "
-             "waiting for it to appear in Géorisques.",
-        "C": "Report your damage to your insurer now, without waiting for the decree. Also report it to your town "
-             "hall to support its recognition request.",
-        "E": "The legal deadline has passed. Contact your insurer immediately and explain your situation.",
-        "D": "No recent procedure detected. If you have damage, report it to your insurer anyway and tell your town "
-             "hall, which can request recognition.",
-    }[cas]
+def arrete_retenu(cas, arretes):
+    """Cas A : l'arrêté au délai en cours ; cas E : le dernier arrêté expiré ; sinon None (pas encore d'arrêté)."""
+    en_cours, depasses = trier_arretes(arretes)
+    if cas == "A" and en_cours:
+        return en_cours[0]
+    if cas == "E" and depasses:
+        return depasses[0]
+    return None
 
 
-def gerer_erreur(action):
-    """Exécute `action` et affiche un message clair en cas de problème. Renvoie son résultat, ou None."""
+def executer(action):
+    """Exécute `action` ; en cas de problème, affiche un message simple (le détail va dans les infos techniques)."""
     try:
         return action()
     except LimiteTokensAtteinte:
         st.error(t("limite_tokens"))
-    except Exception as erreur:  # réseau, API indisponible, réponse illisible...
-        st.error(t("erreur_technique", detail=str(erreur)[:200]))
+    except Exception as erreur:  # réseau, service indisponible, réponse illisible...
+        st.session_state.tech["erreurs"].append(str(erreur)[:300])
+        st.error(t("erreur_technique"))
     return None
 
 
-def df_depuis_inventaire(inventaire):
-    colonnes = ["photo", "zone", "objet", "dommage", "certitude", "valeur"]
-    df = pd.DataFrame([{**{c: l.get(c) for c in colonnes[:-1]}, "valeur": None} for l in inventaire], columns=colonnes)
-    return df.astype({"photo": "Int64", "valeur": "float64"})
+def note(texte):
+    """Petit texte d'aide, gris foncé : plus lisible que st.caption pour une personne âgée."""
+    st.markdown(f'<div class="note">{html.escape(texte)}</div>', unsafe_allow_html=True)
+
+
+def valeur_en_texte(valeur):
+    return f"{round(float(valeur)):,} €".replace(",", " ") if valeur is not None and not pd.isna(valeur) else A_COMPLETER
+
+
+def dommages_vers_inventaire(dommages):
+    """Les dégâts vérifiés par le sinistré, au format attendu par la lettre et le PDF."""
+    return [{"zone": d["zone"] or A_COMPLETER, "objet": d["objet"], "dommage": d["dommage"] or A_COMPLETER,
+             "certitude": d["certitude"], "photo": d["photo"], "valeur_estimee": valeur_en_texte(d["valeur"])}
+            for d in dommages]
+
+
+def nouveau_dommage(photo, zone, objet, dommage, certitude, valeur=None, relu=False):
+    identifiant = st.session_state.prochain_id
+    st.session_state.prochain_id += 1
+    return {"id": identifiant, "photo": photo, "zone": zone, "objet": objet, "dommage": dommage,
+            "certitude": certitude, "valeur": valeur, "relu": relu}
 
 
 def _texte(valeur):
     return "" if valeur is None or (not isinstance(valeur, str) and pd.isna(valeur)) else str(valeur).strip()
 
 
-def df_vers_inventaire(df):
-    """Convertit le tableau modifié par le sinistré en lignes d'inventaire pour la lettre."""
-    lignes = []
-    for _, r in df.iterrows():
-        objet = _texte(r.get("objet"))
-        if not objet:
-            continue  # ligne vide : ignorée
-        valeur = r.get("valeur")
-        lignes.append({
-            "zone": _texte(r.get("zone")) or A_COMPLETER,
-            "objet": objet,
-            "dommage": _texte(r.get("dommage")) or A_COMPLETER,
-            # Une ligne ajoutée par le sinistré lui-même est considérée comme certaine
-            "certitude": r.get("certitude") if r.get("certitude") in (CERTAIN, PROBABLE) else CERTAIN,
-            "photo": int(r["photo"]) if _texte(r.get("photo")) else None,
-            "valeur_estimee": f"{round(float(valeur)):,} €".replace(",", " ") if _texte(valeur) else A_COMPLETER,
-        })
-    return lignes
+# --- Actions sur la liste des dégâts (appelées par les boutons, avant le réaffichage de la page) ---
+def trouver(identifiant):
+    return next(d for d in st.session_state.dommages if d["id"] == identifiant)
+
+
+def marquer_correct(identifiant):
+    trouver(identifiant)["relu"] = True
+
+
+def ouvrir_edition(identifiant):
+    st.session_state.update(edition=identifiant, ajout=False)
+
+
+def supprimer_dommage(identifiant):
+    dommages = st.session_state.dommages
+    position = next(i for i, d in enumerate(dommages) if d["id"] == identifiant)
+    st.session_state.supprime = (position, dommages.pop(position))
+    st.session_state.version_tableau += 1
+
+
+def annuler_suppression():
+    position, dommage = st.session_state.supprime
+    st.session_state.dommages.insert(position, dommage)
+    st.session_state.supprime = None
+    st.session_state.version_tableau += 1
+
+
+def lire_formulaire(prefixe):
+    s = st.session_state
+    return {"zone": s[f"{prefixe}_zone"].strip(), "objet": s[f"{prefixe}_objet"].strip(),
+            "dommage": s[f"{prefixe}_dommage"].strip(), "valeur": s[f"{prefixe}_valeur"],
+            "certitude": PROBABLE if s[f"{prefixe}_incertain"] else CERTAIN}
+
+
+def enregistrer_edition(identifiant):
+    champs = lire_formulaire(f"ed{identifiant}")
+    if champs["objet"]:
+        trouver(identifiant).update(champs, relu=True)  # modifier un dégât vaut vérification
+        st.session_state.edition = None
+        st.session_state.version_tableau += 1
+
+
+def enregistrer_ajout():
+    champs = lire_formulaire("aj")
+    if champs["objet"]:
+        st.session_state.dommages.append(nouveau_dommage(None, relu=True, **champs))
+        st.session_state.ajout = False
+        st.session_state.version_tableau += 1
+
+
+def fermer_formulaires():
+    st.session_state.update(edition=None, ajout=False)
 
 
 # ---------------------------------------------------------------------------------------------
 # Affichage
 # ---------------------------------------------------------------------------------------------
 def afficher_entete():
-    col_titre, col_langue = st.columns([5, 1.3])
-    with col_titre:
-        st.markdown('<h1 class="titre">🌊 30 Days</h1>', unsafe_allow_html=True)
-        st.markdown(f'<p class="slogan">{html.escape(t("slogan"))}</p>', unsafe_allow_html=True)
-    with col_langue:
-        st.radio("Langue / Language", ["fr", "en"], key="langue", horizontal=True, label_visibility="collapsed",
-                 format_func=lambda l: {"fr": "🇫🇷 FR", "en": "🇬🇧 EN"}[l])
-    st.button(t("demo"), on_click=lancer_demo, help=t("demo_aide"), type="secondary", width="stretch")
-    with st.expander(t("comment")):
-        col_code, col_ia = st.columns(2)
-        with col_code:
-            st.markdown(t("comment_code"))
-            st.markdown("\n".join(f"- {ligne}" for ligne in t("comment_code_liste")))
-        with col_ia:
-            st.markdown(t("comment_ia"))
-            st.markdown("\n".join(f"- {ligne.format(radar=MODELE_RADAR, vision=MODELE_VISION, lettre=MODELE_LETTRE)}"
-                                  for ligne in t("comment_ia_liste")))
-        st.info(t("comment_regle"))
-
-
-def afficher_progression():
+    col_marque, col_langue = st.columns([4, 1.4], vertical_alignment="center")
+    col_marque.markdown(f'<div class="marque"><span class="nom">🌊 30 Days</span>'
+                        f'<span class="slogan">{html.escape(t("slogan"))}</span></div>', unsafe_allow_html=True)
+    col_langue.radio("Langue / Language", ["fr", "en"], key="langue", horizontal=True, label_visibility="collapsed",
+                     format_func=lambda l: {"fr": "🇫🇷 FR", "en": "🇬🇧 EN"}[l])
+    if st.session_state.etape == 1:
+        st.button(t("demo"), on_click=lancer_demo, help=t("demo_aide"), width="stretch")
     etape = st.session_state.etape
-    noms = t("etapes")
-    pastilles = "".join(
-        f'<span class="etape {"active" if i == etape else "faite" if i < etape else ""}">{i}. {html.escape(nom)}</span>'
-        for i, nom in enumerate(noms, start=1)
-    )
-    st.markdown(f'<div class="etapes">{pastilles}</div>', unsafe_allow_html=True)
-    st.progress(etape / 3, text=t("etape_n", n=etape, nom=noms[etape - 1]))
+    st.markdown(f'<h2 class="etape">{html.escape(t("etape_n", n=etape, nom=t("etapes")[etape - 1]))}</h2>',
+                unsafe_allow_html=True)
+    st.progress(etape / 3)
 
 
 def afficher_source(affirmation):
     niveau = affirmation["niveau"]
-    badges = f'<span class="badge" style="background:{COULEURS_BADGES.get(niveau, "#5f6b7a")}">{html.escape(t("badges").get(niveau, niveau))}</span>'
+    lien = affirmation["source"]
+    site = t("georisques") if niveau == "Géorisques" else (urlparse(lien).netloc.removeprefix("www.") or lien)
+    badges = (f'<span class="badge" style="background:{COULEURS_BADGES.get(niveau, "#4a5563")}">'
+              f'{html.escape(t("badges").get(niveau, niveau))}</span>')
     if affirmation["statut"] == NON_OFFICIEL:
         badges += f'<span class="badge contour">{html.escape(t("a_verifier"))}</span>'
     citation = (f'<div class="citation">« {html.escape(affirmation["citation"])} »</div>'
                 if affirmation.get("citation") else "")
-    lien = affirmation["source"]
-    nom_lien = urlparse(lien).netloc.removeprefix("www.") or lien
     st.markdown(
-        f'<div class="source">{badges}<div class="texte">{html.escape(affirmation["texte"])}</div>{citation}'
-        f'<a href="{html.escape(lien)}" target="_blank" rel="noopener">↗ {html.escape(nom_lien)}</a></div>',
+        f'<div class="source"><span class="site">{html.escape(site)}</span>{badges}'
+        f'<div class="texte">{html.escape(affirmation["texte"])}</div>{citation}'
+        f'<a href="{html.escape(lien)}" target="_blank" rel="noopener">{html.escape(t("voir_source"))} ↗</a></div>',
         unsafe_allow_html=True,
     )
 
 
 def afficher_radar():
+    """La carte répond à 3 questions, avec des textes écrits par le code (jamais par l'IA)."""
     donnees, commune = st.session_state.radar, st.session_state.commune
     resultat = donnees["resultat"]
     cas = resultat["cas"]
     en_cours, depasses = trier_arretes(donnees["arretes"])
+    arrete = arrete_retenu(cas, donnees["arretes"])
     couleur = COULEURS_CAS[cas]
+    faits = {"commune": commune["nom"], "type": "", "jo": "", "limite": ""}
+    if arrete:
+        calcul = arrete[1]
+        faits.update(type=calcul["type"].lower(), jo=_format(calcul["publication_jo"]),
+                     limite=_format(calcul["date_limite"]))
 
-    detail = ""
-    if cas == "A" and en_cours:
-        c = en_cours[0][1]
-        unite = t("jour_restant") if c["jours_restants"] <= 1 else t("jours_restants")
-        detail = (f'<div class="compte" style="color:{couleur}">{c["jours_restants"]}</div>'
-                  f'<div class="compte-texte">{unite}</div><div>{t("avant_le", date=_format(c["date_limite"]))}</div>')
-    elif cas == "E" and depasses:
-        detail = f'<div>{t("depasse_le", date=_format(depasses[0][1]["date_limite"]))}</div>'
+    compte = ""
+    if cas == "A" and arrete:
+        jours = arrete[1]["jours_restants"]
+        compte = f'<div class="compte">{t("compte_1") if jours <= 0 else t("compte", n=jours)}</div>'
+    e = html.escape
     st.markdown(
-        f'<div class="carte" style="border-color:{couleur}; background:{couleur}12">'
-        f'<div class="cas" style="color:{couleur}">{html.escape(commune["nom"])} ({commune["departement"]}) · {t("cas", cas=cas)}</div>'
-        f'<div class="libelle">{html.escape(t("libelles")[cas])}</div>{detail}'
-        f'<div class="conseil">👉 <b>{html.escape(conseil(cas, resultat, en_cours))}</b></div></div>',
+        f'<div class="carte" style="border-color:{couleur}; background:{couleur}0f">'
+        f'<div class="statut" style="color:{couleur}">{e(t("statuts")[cas])}</div>'
+        f'<div class="question" style="color:{couleur}">{e(t("q_situation"))}</div>'
+        f'<div class="reponse">{e(t("situation")[cas].format(**faits))}</div>'
+        f'<div class="question" style="color:{couleur}">{e(t("q_faire"))}</div>'
+        f'<div class="reponse"><b>{e(t("faire")[cas])}</b></div>'
+        f'<div class="question" style="color:{couleur}">{e(t("q_date"))}</div>'
+        f'<div class="date" style="color:{couleur}">{e(t("date")[cas].format(**faits))}</div>{compte}'
+        f'<div class="detail">{e(t("date_detail")[cas].format(**faits))}</div></div>',
         unsafe_allow_html=True,
     )
 
     if cas != "E" and depasses:
-        brut, c = depasses[0]
-        st.info(t("info_depasse", type=c["type"], jo=_format(c["publication_jo"]), limite=_format(c["date_limite"])))
+        c = depasses[0][1]
+        st.info(t("info_depasse", type=c["type"].lower(), jo=_format(c["publication_jo"]),
+                  limite=_format(c["date_limite"])))
 
-    st.markdown(f"**{t('explication_ia')}** : {resultat['explication']}")
-    with st.expander(t("verifications")):
-        if resultat["corrections"]:
-            st.markdown(t("corrections"))
-            st.markdown("\n".join(f"- {c}" for c in resultat["corrections"]))
-        else:
-            st.markdown(t("aucune_correction"))
-        if resultat["rejetees"]:
-            st.markdown(t("rejetees"))
-            st.markdown("\n".join(f"- {r['raison']} ({r['source'] or '—'})" for r in resultat["rejetees"]))
-        st.caption(t("cout", tokens=resultat["tokens"]["total_tokens"]))
+    with st.expander(t("pourquoi")):
+        if t("sources_fr"):
+            note(t("sources_fr"))
+        if resultat["explication"] and not resultat["corrections"]:
+            st.markdown(f"**{t('resume_ia')}** {resultat['explication']}")
+        for affirmation in resultat["affirmations"]:
+            afficher_source(affirmation)
 
-    st.markdown(f"#### {t('sources')}")
-    if t("sources_fr"):
-        st.caption(t("sources_fr"))
-    for affirmation in resultat["affirmations"]:
-        afficher_source(affirmation)
+
+def afficher_carte_dommage(d):
+    """Une carte par dégât : miniature, une phrase, et les boutons Correct / Modifier / Supprimer."""
+    miniatures = st.session_state.miniatures
+    if d["photo"] and d["photo"] <= len(miniatures):
+        image = f'<img src="data:image/jpeg;base64,{base64.b64encode(miniatures[d["photo"] - 1]).decode()}" alt="">'
+        origine = t("photo_n", n=d["photo"])
+    else:
+        image, origine = '<div class="vide">📝</div>', t("sans_photo")
+    infos = [html.escape(origine)]
+    if d["valeur"] is not None and not pd.isna(d["valeur"]):
+        infos.append(html.escape(t("valeur_txt", v=valeur_en_texte(d["valeur"]))))
+    if d["certitude"] == PROBABLE:
+        infos.append(f'<span class="incertain">{html.escape(t("a_confirmer"))}</span>')
+    if d["relu"]:
+        infos.append(f'<span class="ok">{html.escape(t("verifie"))}</span>')
+    dommage = d["dommage"].rstrip(".")
+    phrase = f"<b>{html.escape(d['objet'][:1].upper() + d['objet'][1:])}</b>" + (f" : {html.escape(dommage)}." if dommage else "")
+    # La clé du conteneur devient sa classe CSS : bordure verte quand le dégât est vérifié
+    with st.container(key=f"carte_{d['id']}{'_ok' if d['relu'] else ''}"):
+        st.markdown(f'<div class="dommage">{image}<div><div class="phrase">{phrase}</div>'
+                    f'<div class="infos">{" · ".join(infos)}</div></div></div>', unsafe_allow_html=True)
+        with st.container(horizontal=True, gap="small"):
+            if not d["relu"]:
+                st.button(t("correct"), key=f"ok_{d['id']}", on_click=marquer_correct, args=(d["id"],))
+            st.button(t("modifier"), key=f"mod_{d['id']}", on_click=ouvrir_edition, args=(d["id"],))
+            st.button(t("supprimer"), key=f"sup_{d['id']}", on_click=supprimer_dommage, args=(d["id"],))
+
+
+def formulaire_dommage(prefixe, d, au_clic, args=()):
+    """Formulaire de modification (d = le dégât) ou d'ajout (d = None)."""
+    d = d or {"zone": "", "objet": "", "dommage": "", "valeur": None, "certitude": CERTAIN}
+    with st.form(f"form_{prefixe}", border=True):
+        st.text_input(t("champ_zone"), value=d["zone"], key=f"{prefixe}_zone")
+        st.text_input(t("champ_objet"), value=d["objet"], key=f"{prefixe}_objet")
+        st.text_area(t("champ_dommage"), value=d["dommage"], key=f"{prefixe}_dommage", height=90)
+        valeur = None if d["valeur"] is None or pd.isna(d["valeur"]) else float(d["valeur"])
+        st.number_input(t("champ_valeur"), value=valeur, min_value=0.0, step=10.0, format="%.0f",
+                        key=f"{prefixe}_valeur", help=t("champ_valeur_aide"))
+        st.checkbox(t("champ_incertain"), value=d["certitude"] == PROBABLE, key=f"{prefixe}_incertain")
+        with st.container(horizontal=True, gap="small"):
+            envoye = st.form_submit_button(t("enregistrer"), type="primary", on_click=au_clic, args=args)
+            st.form_submit_button(t("annuler"), on_click=fermer_formulaires)
+    if envoye and not st.session_state.get(f"{prefixe}_objet", "").strip():
+        st.warning(t("objet_obligatoire"))
+
+
+def afficher_liste_dommages():
+    dommages = st.session_state.dommages
+    if st.session_state.supprime:
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(t("supprime", objet=st.session_state.supprime[1]["objet"]))
+            st.button(t("annuler_suppression"), on_click=annuler_suppression)
+    if not dommages:
+        st.info(t("liste_vide"))
+    # Regroupés par pièce, dans l'ordre où les pièces apparaissent
+    for piece in dict.fromkeys(d["zone"] for d in dommages):
+        st.markdown(f'<div class="piece">{html.escape((piece or "—").capitalize())}</div>', unsafe_allow_html=True)
+        for d in (d for d in dommages if d["zone"] == piece):
+            if st.session_state.edition == d["id"]:
+                formulaire_dommage(f"ed{d['id']}", d, enregistrer_edition, (d["id"],))
+            else:
+                afficher_carte_dommage(d)
+    st.write("")
+    if st.session_state.ajout:
+        formulaire_dommage("aj", None, enregistrer_ajout)
+    else:
+        st.button(t("ajouter"), on_click=lambda: st.session_state.update(ajout=True, edition=None), width="stretch")
+
+
+def afficher_tableau_dommages():
+    note(t("tableau_aide"))
+    noms = t("colonnes")
+    colonnes = ["photo", "zone", "objet", "dommage", "certitude", "valeur"]
+    df = pd.DataFrame([{c: d[c] for c in colonnes} for d in st.session_state.dommages], columns=colonnes)
+    df = df.astype({"photo": "Int64", "valeur": "float64"})
+    # Nouvelle clé à chaque changement venu des cartes : le tableau repart des données à jour
+    edite = st.data_editor(
+        df, key=f"tableau_{st.session_state.version_tableau}", num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={
+            "photo": st.column_config.NumberColumn(noms["photo"], min_value=1, step=1, width="small"),
+            "zone": st.column_config.TextColumn(noms["zone"]),
+            "objet": st.column_config.TextColumn(noms["objet"], required=True),
+            "dommage": st.column_config.TextColumn(noms["dommage"], width="large"),
+            "certitude": st.column_config.SelectboxColumn(noms["certitude"], options=[CERTAIN, PROBABLE]),
+            "valeur": st.column_config.NumberColumn(noms["valeur"], min_value=0, step=10, format="%d €"),
+        },
+    )
+    if st.button(t("enregistrer_tableau"), width="stretch"):
+        nouveaux = []
+        for _, r in edite.iterrows():
+            if not _texte(r["objet"]):
+                continue  # ligne vide : ignorée
+            photo = int(r["photo"]) if _texte(r["photo"]) else None
+            # Une ligne ajoutée par le sinistré lui-même est considérée comme certaine
+            certitude = r["certitude"] if r["certitude"] in (CERTAIN, PROBABLE) else CERTAIN
+            valeur = None if pd.isna(r["valeur"]) else float(r["valeur"])
+            nouveaux.append(nouveau_dommage(photo, _texte(r["zone"]), _texte(r["objet"]), _texte(r["dommage"]),
+                                            certitude, valeur, relu=True))
+        st.session_state.update(dommages=nouveaux, supprime=None, edition=None, ajout=False)
+        st.session_state.version_tableau += 1
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------------------------
 # Les 3 étapes
 # ---------------------------------------------------------------------------------------------
 def etape_commune():
-    col_nom, col_dep = st.columns([3, 1])
+    st.markdown(f'<div class="intro">{html.escape(t("intro_1"))}</div>', unsafe_allow_html=True)
+    col_nom, col_dep = st.columns([3, 2])
     nom = col_nom.text_input(t("commune"), key="saisie_commune", placeholder="Martigues").strip()
     dep = col_dep.text_input(t("departement"), key="saisie_dep", placeholder="13", max_chars=3,
                              help=t("departement_aide")).strip()
@@ -593,19 +950,24 @@ def etape_commune():
         )
 
     demande_demo = st.session_state.pop("lancer_analyse", False)
-    clic = st.button(t("analyser"), type="primary", disabled=choix is None, width="stretch")
+    deja_analyse = st.session_state.radar is not None
+    clic = st.button(t("analyser"), type="secondary" if deja_analyse else "primary", width="stretch")
+    if clic and not choix:
+        st.warning(t("choisir_d_abord"))
     if (clic or demande_demo) and choix:
         if st.session_state.compteurs["analyses"] >= LIMITES["analyses"]:
             st.error(t("limite_analyses"))
         else:
             with st.spinner(t("analyse_en_cours")):
-                donnees = gerer_erreur(lambda: radar_commune(choix["code"], choix["nom"], choix["codeDepartement"]))
+                donnees = executer(lambda: radar_commune(choix["code"], choix["nom"], choix["codeDepartement"]))
             if donnees:
                 st.session_state.compteurs["analyses"] += 1
                 st.session_state.commune = {"nom": choix["nom"], "code": choix["code"],
                                             "departement": choix["codeDepartement"]}
                 st.session_state.radar = donnees
+                st.session_state.tech["radar"] = donnees["resultat"]["tokens"]["total_tokens"]
                 st.session_state.resultat_lettre = None
+                st.rerun()  # réaffiche la page : le bouton « Continuer » devient la seule action principale
 
     if st.session_state.radar:
         afficher_radar()
@@ -616,205 +978,225 @@ def etape_commune():
 
 def etape_degats():
     compteurs = st.session_state.compteurs
-    restantes = LIMITES["photos"] - compteurs["photos"]
-    fichiers = []
-    if st.session_state.demo_photos:
-        st.info(t("photos_demo_info"))
-        colonnes = st.columns(len(PHOTOS_DEMO))
-        for numero, (colonne, chemin) in enumerate(zip(colonnes, PHOTOS_DEMO), start=1):
-            colonne.image(str(chemin), caption=f"{numero}. {chemin.name}", width="stretch")
-        st.caption(t("credits_photos", url=URL_DEPOT))
-        if st.button(t("utiliser_mes_photos")):
-            st.session_state.demo_photos = False
-            st.rerun()
-    else:
-        fichiers = st.file_uploader(t("ajouter_photos"), type=["jpg", "jpeg", "png", "webp"],
-                                    accept_multiple_files=True, help=t("aide_photos", n=restantes)) or []
+    dommages = st.session_state.dommages
 
-    st.text_area(t("description"), key="description", placeholder=t("description_exemple"))
+    if dommages is None:  # avant l'analyse : choisir les photos
+        st.markdown(f'<div class="intro">{html.escape(t("intro_2"))}</div>', unsafe_allow_html=True)
+        note(t("prive"))
+        restantes = LIMITES["photos"] - compteurs["photos"]
+        fichiers = []
+        if st.session_state.demo_photos:
+            st.info(t("photos_demo_info"))
+            vignettes = "".join(
+                f'<figure><img src="data:image/jpeg;base64,{base64.b64encode(miniature_demo(str(c))).decode()}" alt="">'
+                f'<figcaption>{html.escape(t("photo_n", n=i))}</figcaption></figure>'
+                for i, c in enumerate(PHOTOS_DEMO, start=1))
+            st.markdown(f'<div class="vignettes">{vignettes}</div>', unsafe_allow_html=True)
+            note(t("credits_photos"))
+            st.button(t("utiliser_mes_photos"), on_click=lambda: st.session_state.update(demo_photos=False))
+        else:
+            fichiers = st.file_uploader(t("ajouter_photos"), type=["jpg", "jpeg", "png", "webp"],
+                                        accept_multiple_files=True, help=t("aide_photos", n=restantes)) or []
+        st.text_area(t("description"), key="description", placeholder=t("description_exemple"))
 
-    nombre = len(PHOTOS_DEMO) if st.session_state.demo_photos else len(fichiers)
-    if nombre:
-        if st.button(t("analyser_photos", n=nombre), type="primary", width="stretch"):
+        nombre = len(PHOTOS_DEMO) if st.session_state.demo_photos else len(fichiers)
+        if nombre and st.button(t("analyser_photos", n=nombre), type="primary", width="stretch"):
             if nombre > LIMITES["photos"]:
                 st.error(t("trop_de_photos"))
             elif not st.session_state.demo_photos and nombre > restantes:
                 st.error(t("limite_photos", n=restantes))
             else:
+                sources = PHOTOS_DEMO if st.session_state.demo_photos else fichiers
                 with st.spinner(t("analyse_photos_en_cours")):
-                    analyse = gerer_erreur(inventaire_demo if st.session_state.demo_photos
-                                           else lambda: analyser_photos(fichiers))
+                    analyse = executer(inventaire_demo if st.session_state.demo_photos
+                                       else lambda: analyser_photos(fichiers))
                 if analyse:
                     if not st.session_state.demo_photos:  # les photos de démo, déjà analysées, ne comptent pas
                         compteurs["photos"] += nombre
-                    st.session_state.pop("editeur_inventaire", None)
                     st.session_state.update(
-                        inventaire_df=df_depuis_inventaire(analyse["inventaire"]),
-                        inventaire_photos=analyse["photos"], inventaire_rejetees=len(analyse["rejetees"]),
-                        inventaire_valide=None, tokens_photos=analyse["tokens"]["total_tokens"],
+                        miniatures=[miniature_demo(str(s)) if st.session_state.demo_photos else miniature(s)
+                                    for s in sources], supprime=None, edition=None, ajout=False,
+                        dommages=[nouveau_dommage(l["photo"], l["zone"], l["objet"], l["dommage"], l["certitude"])
+                                  for l in analyse["inventaire"]],
                     )
+                    st.session_state.tech.update(photos=analyse["tokens"]["total_tokens"],
+                                                 lignes_rejetees=len(analyse["rejetees"]))
+                    st.rerun()
+        if not nombre:
+            st.button(t("sans_photos"), on_click=lambda: st.session_state.update(dommages=[]), width="stretch")
+    else:  # après l'analyse : vérifier chaque dégât
+        st.markdown(f'<div class="soustitre">{html.escape(t("verifier_titre"))}</div>', unsafe_allow_html=True)
+        st.markdown(t("verifier_aide"))
+        relus = sum(d["relu"] for d in dommages)
+        if dommages:
+            st.markdown(f'<div class="compteur">{t("verifies", n=relus, total=len(dommages))}</div>',
+                        unsafe_allow_html=True)
+            st.progress(relus / len(dommages))
+        onglet_liste, onglet_tableau = st.tabs([t("onglet_liste"), t("onglet_tableau")])
+        with onglet_liste:
+            afficher_liste_dommages()
+        with onglet_tableau:
+            afficher_tableau_dommages()
+        st.text_area(t("description"), key="description", placeholder=t("description_exemple"))
 
-    if st.session_state.inventaire_df is None:
-        if st.button(t("inventaire_manuel")):
-            st.session_state.inventaire_df = df_depuis_inventaire([])
+    dommages = st.session_state.dommages or []
+    tout_relu = all(d["relu"] for d in dommages)
+    pret = (dommages and tout_relu) or (not dommages and st.session_state.description.strip())
+    if dommages and tout_relu:
+        st.success(t("tout_verifie"))
+    if pret:
+        if st.button(t("continuer_lettre"), type="primary", width="stretch"):
+            fermer_formulaires()
+            st.session_state.etape = 3
             st.rerun()
-        inventaire_courant = []
-    else:
-        st.markdown(f"#### {t('inventaire')}")
-        st.caption(t("inventaire_aide"))
-        noms = t("colonnes")
-        edite = st.data_editor(
-            st.session_state.inventaire_df, key="editeur_inventaire", num_rows="dynamic", hide_index=True,
-            width="stretch",
-            column_config={
-                "photo": st.column_config.NumberColumn(noms["photo"], min_value=1, step=1, width="small"),
-                "zone": st.column_config.TextColumn(noms["zone"]),
-                "objet": st.column_config.TextColumn(noms["objet"], required=True),
-                "dommage": st.column_config.TextColumn(noms["dommage"], width="large"),
-                "certitude": st.column_config.SelectboxColumn(noms["certitude"], options=[CERTAIN, PROBABLE]),
-                "valeur": st.column_config.NumberColumn(noms["valeur"], min_value=0, step=10, format="%d €"),
-            },
-        )
-        if st.session_state.inventaire_photos:
-            st.caption(t("photos_numeros", liste=" · ".join(
-                f"{i}. {nom}" for i, nom in enumerate(st.session_state.inventaire_photos, start=1))))
-        if st.session_state.inventaire_rejetees:
-            st.caption(t("lignes_rejetees", n=st.session_state.inventaire_rejetees))
-        if st.session_state.tokens_photos:
-            st.caption(t("cout", tokens=st.session_state.tokens_photos))
-        inventaire_courant = df_vers_inventaire(edite)
-        if st.button(t("relu"), type="primary", width="stretch"):
-            st.session_state.inventaire_valide = inventaire_courant
-
-    valide = st.session_state.inventaire_valide
-    inventaire_relu = valide is not None and valide == inventaire_courant
-    if valide is not None and not inventaire_relu:
-        st.warning(t("modifs_non_validees"))
-    elif inventaire_relu:
-        st.success(t("relu_ok", n=len(valide)))
-
-    pret = inventaire_relu or (not inventaire_courant and st.session_state.get("description", "").strip())
-    if not pret:
-        st.caption(t("relire_obligatoire") if inventaire_courant else t("rien_a_declarer"))
-
-    col_retour, col_suite = st.columns(2)
-    if col_retour.button(t("retour"), width="stretch"):
+    elif st.session_state.dommages is not None:
+        note(t("reste_a_verifier") if dommages else t("rien_a_declarer"))
+    if st.button(t("retour"), width="stretch"):
         st.session_state.etape = 1
-        st.rerun()
-    if col_suite.button(t("continuer_lettre"), type="primary", disabled=not pret, width="stretch"):
-        st.session_state.inventaire_lettre = valide if inventaire_relu else []
-        st.session_state.etape = 3
         st.rerun()
 
 
 def etape_lettre():
     donnees, commune = st.session_state.radar, st.session_state.commune
     cas = donnees["resultat"]["cas"]
-    en_cours, depasses = trier_arretes(donnees["arretes"])
-    # Cas A : l'arrêté au délai en cours ; cas E : le dernier arrêté expiré ; sinon pas encore d'arrêté
-    arrete = en_cours[0] if cas == "A" and en_cours else depasses[0] if cas == "E" and depasses else None
-
-    if t("lettre_en_francais"):
-        st.info(t("lettre_en_francais"))
-    if arrete:
-        st.info(t("lettre_avec_arrete", ref=arrete[0].get("code_national_catnat", "?"),
-                  jo=_format(arrete[1]["publication_jo"])))
-    else:
-        st.info(t("lettre_sans_arrete"))
-    if cas == "E":
-        st.warning(t("alerte_depasse"))
-
-    with st.form("formulaire_lettre"):
-        st.text_input(t("nom"), key="f_nom")
-        st.text_input(t("adresse"), key="f_adresse")
-        col_a, col_b = st.columns(2)
-        col_a.text_input(t("assureur"), key="f_assureur")
-        col_b.text_input(t("contrat"), key="f_contrat")
-        st.text_input(t("adresse_assureur"), key="f_adresse_assureur")
-        if not arrete:
-            st.text_input(t("type_evenement"), key="f_type", placeholder=t("type_exemple"))
-            col_c, col_d = st.columns(2)
-            col_c.date_input(t("date_debut"), key="f_debut", value=st.session_state.get("f_debut"), format="DD/MM/YYYY")
-            col_d.date_input(t("date_fin"), key="f_fin", value=st.session_state.get("f_fin"), format="DD/MM/YYYY")
-        st.caption(t("vide_a_completer"))
-        envoyer = st.form_submit_button(t("generer"), type="primary", width="stretch")
-
-    if envoyer:
-        if st.session_state.compteurs["lettres"] >= LIMITES["lettres"]:
-            st.error(t("limite_lettres"))
-        else:
-            sinistre = {
-                "nom": st.session_state.f_nom, "adresse": st.session_state.f_adresse,
-                "assureur": st.session_state.f_assureur, "adresse_assureur": st.session_state.f_adresse_assureur,
-                "numero_contrat": st.session_state.f_contrat,
-                "description_degats": st.session_state.get("description", ""),
-                "commune": commune["nom"], "type_evenement": st.session_state.get("f_type"),
-                "date_debut": st.session_state.get("f_debut"), "date_fin": st.session_state.get("f_fin"),
-            }
-            inventaire = st.session_state.inventaire_lettre or None
-            with st.spinner(t("generation")):
-                resultat = gerer_erreur(lambda: generer_lettre(arrete[0] if arrete else None, sinistre, inventaire))
-            if resultat:
-                st.session_state.compteurs["lettres"] += 1
-                resultat["pdf"] = lettre_en_pdf(resultat["lettre"], inventaire)
-                resultat["inventaire"] = inventaire
-                st.session_state.resultat_lettre = resultat
-
+    arrete = arrete_retenu(cas, donnees["arretes"])
     resultat = st.session_state.resultat_lettre
-    if resultat:
-        st.markdown(f"#### {t('apercu')}")
-        corps = resultat["lettre"].split(SEPARATEUR_ANNEXE)[0].strip()
-        st.markdown(f'<div class="lettre">{html.escape(corps)}</div>', unsafe_allow_html=True)
-        if resultat["inventaire"]:
-            st.markdown(f"**{TITRE_ANNEXE}**")
-            st.dataframe(pd.DataFrame(resultat["inventaire"]).rename(columns={
-                "zone": "Pièce", "objet": "Objet", "dommage": "Dommage constaté", "certitude": "Certitude",
-                "photo": "Photo", "valeur_estimee": "Valeur estimée"}), hide_index=True, width="stretch")
-            st.caption(NOTE_ANNEXE)
-        if resultat["secours"]:  # l'IA a échoué : lettre du modèle fixe, signalée discrètement
-            st.caption(t("version_simplifiee"))
-        elif resultat["rejets"]:
-            st.caption(t("brouillons_refuses", n=len(resultat["rejets"])))
-        st.caption(t("cout", tokens=resultat["tokens"]["total_tokens"]))
 
-        st.download_button(t("telecharger"), data=resultat["pdf"], file_name="declaration_sinistre_catnat.pdf",
+    if resultat is None:
+        st.markdown(f'<div class="intro">{html.escape(t("intro_3"))}</div>', unsafe_allow_html=True)
+        if t("lettre_en_francais"):
+            st.info(t("lettre_en_francais"))
+        if arrete:
+            st.info(t("lettre_avec_arrete", jo=_format(arrete[1]["publication_jo"])))
+        else:
+            st.info(t("lettre_sans_arrete"))
+        if cas == "E":
+            st.warning(t("alerte_depasse"))
+
+        with st.form("formulaire_lettre", border=False):
+            st.text_input(t("nom"), key="f_nom")
+            st.text_input(t("adresse"), key="f_adresse")
+            st.text_input(t("assureur"), key="f_assureur")
+            st.text_input(t("adresse_assureur"), key="f_adresse_assureur")
+            st.text_input(t("contrat"), key="f_contrat", help=t("aide_contrat"))
+            if not arrete:
+                st.selectbox(t("type_evenement"), TYPES_EVENEMENT, key="f_type", accept_new_options=True,
+                             placeholder=t("type_choisir"))
+                st.date_input(t("date_debut"), key="f_debut", format="DD/MM/YYYY")
+                st.date_input(t("date_fin"), key="f_fin", format="DD/MM/YYYY")
+            note(t("vide_a_completer"))
+            envoyer = st.form_submit_button(t("generer"), type="primary", width="stretch")
+
+        if envoyer:
+            if st.session_state.compteurs["lettres"] >= LIMITES["lettres"]:
+                st.error(t("limite_lettres"))
+            else:
+                s = st.session_state
+                sinistre = {
+                    "nom": s.f_nom, "adresse": s.f_adresse, "assureur": s.f_assureur,
+                    "adresse_assureur": s.f_adresse_assureur, "numero_contrat": s.f_contrat,
+                    "description_degats": s.description, "commune": commune["nom"],
+                    "type_evenement": s.f_type, "date_debut": s.f_debut, "date_fin": s.f_fin,
+                }
+                inventaire = dommages_vers_inventaire(s.dommages or []) or None
+                with st.spinner(t("generation")):
+                    resultat = executer(lambda: generer_lettre(arrete[0] if arrete else None, sinistre, inventaire))
+                if resultat:
+                    s.compteurs["lettres"] += 1
+                    resultat["pdf"] = lettre_en_pdf(resultat["lettre"], inventaire)
+                    resultat["inventaire"] = inventaire
+                    s.resultat_lettre = resultat
+                    s.tech["lettre"] = resultat["tokens"]["total_tokens"]
+                    st.rerun()
+    else:
+        st.success(t("lettre_prete"))
+        st.download_button(t("telecharger"), data=resultat["pdf"], file_name="declaration_sinistre.pdf",
                            mime="application/pdf", type="primary", width="stretch")
         st.markdown(t("a_envoyer"))
+        if resultat["secours"]:  # l'IA a échoué : lettre du modèle fixe, signalée discrètement
+            note(t("version_simplifiee"))
+        with st.expander(t("lire_lettre")):
+            corps = resultat["lettre"].split(SEPARATEUR_ANNEXE)[0].strip()
+            st.markdown(f'<div class="lettre">{html.escape(corps).replace(chr(10), "<br>")}</div>',
+                        unsafe_allow_html=True)
+            if resultat["inventaire"]:
+                st.markdown(t("page_2", n=len(resultat["inventaire"])))
 
-        st.markdown(f"#### {t('checklist')}")
-        if t("checklist_fr"):
-            st.caption(t("checklist_fr"))
-        for numero, piece in enumerate(resultat["checklist"]):
-            st.checkbox(piece, key=f"piece_{numero}")
+        blocs = checklist_pieces(arrete[1] if arrete else None, bool(resultat["inventaire"]), st.session_state.langue)
+        for cle, titre in t("blocs").items():
+            st.markdown(f'<div class="soustitre">{html.escape(titre)}</div>', unsafe_allow_html=True)
+            for numero, piece in enumerate(blocs[cle]):
+                st.checkbox(piece, key=f"piece_{cle}_{numero}")
+        st.write("")
+        st.button(t("modifier_infos"), on_click=lambda: st.session_state.update(resultat_lettre=None), width="stretch")
 
     if st.button(t("retour"), width="stretch"):
         st.session_state.etape = 2
         st.rerun()
 
 
+def afficher_bas_de_page():
+    st.divider()
+    with st.expander(t("comment")):
+        col_code, col_ia = st.columns(2)
+        with col_code:
+            st.markdown(t("comment_code"))
+            st.markdown("\n".join(f"- {ligne}" for ligne in t("comment_code_liste")))
+        with col_ia:
+            st.markdown(t("comment_ia"))
+            st.markdown("\n".join(f"- {ligne.format(radar=MODELE_RADAR, vision=MODELE_VISION, lettre=MODELE_LETTRE)}"
+                                  for ligne in t("comment_ia_liste")))
+        st.info(t("comment_regle"))
+
+        # Les infos techniques sont ici, et nulle part ailleurs
+        st.markdown(t("technique"))
+        tech, radar = st.session_state.tech, st.session_state.radar
+        lignes = []
+        if radar:
+            r = radar["resultat"]
+            lignes.append(t("tech_cas", cas=r["cas"], libelle=r["libelle"]))
+        lignes.append(t("tech_tokens", radar=tech["radar"] or "–", photos=tech["photos"] or "–",
+                        lettre=tech["lettre"] or "–"))
+        if tech["lignes_rejetees"]:
+            lignes.append(t("tech_lignes_rejetees", n=tech["lignes_rejetees"]))
+        lettre = st.session_state.resultat_lettre
+        if lettre:
+            lignes.append(t("tech_brouillons", n=len(lettre["rejets"]), secours=t("oui") if lettre["secours"] else t("non")))
+            lignes += [f"   - {html.escape(rejet)}" for rejet in lettre["rejets"]]
+        st.markdown("\n".join(f"- {ligne}" if not ligne.startswith("   ") else ligne for ligne in lignes))
+        if radar:
+            r = radar["resultat"]
+            st.markdown(t("tech_corrections") if r["corrections"] else t("tech_aucune_correction"))
+            if r["corrections"]:
+                st.markdown("\n".join(f"- {c}" for c in r["corrections"]))
+            if r["rejetees"]:
+                st.markdown(t("tech_rejetees"))
+                st.markdown("\n".join(f"- {x['raison']} ({x['source'] or '—'})" for x in r["rejetees"]))
+        if tech["erreurs"]:
+            st.markdown(t("tech_erreurs"))
+            st.markdown("\n".join(f"- `{x}`" for x in tech["erreurs"]))
+
+    c = st.session_state.compteurs
+    st.button(t("effacer"), on_click=effacer_donnees, width="stretch")
+    st.markdown(
+        f'<div class="pied">{html.escape(t("confidentialite"))}<br>{html.escape(t("avertissement"))}<br>'
+        f'{html.escape(t("session", a=c["analyses"], l=c["lettres"], p=c["photos"]))}<br>'
+        f'{html.escape(t("pied"))} · <a href="{URL_DEPOT}" target="_blank" rel="noopener">{t("code_source")}</a></div>',
+        unsafe_allow_html=True,
+    )
+
+
 # ---------------------------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------------------------
-st.set_page_config(page_title="30 Days", page_icon="🌊", layout="centered")
+st.set_page_config(page_title="30 Days", page_icon="🌊", layout="centered", initial_sidebar_state="collapsed")
 initialiser_session()
+garder_saisies()
 st.markdown(CSS, unsafe_allow_html=True)
-
-afficher_entete()
-st.caption(t("confidentialite"))
-afficher_progression()
 
 # Sans commune analysée, on ne peut pas aller plus loin que l'étape 1
 if st.session_state.etape > 1 and not st.session_state.radar:
     st.session_state.etape = 1
+afficher_entete()
 {1: etape_commune, 2: etape_degats, 3: etape_lettre}[st.session_state.etape]()
-
-with st.sidebar:
-    st.markdown(f"### {t('session')}")
-    c = st.session_state.compteurs
-    st.caption(t("restant", a=c["analyses"], l=c["lettres"], p=c["photos"]))
-    st.button(t("effacer"), on_click=effacer_donnees, width="stretch")
-    st.caption(t("avertissement"))
-
-st.markdown(f'<div class="pied">{html.escape(t("avertissement"))}<br>{html.escape(t("pied"))} · '
-            f'<a href="{URL_DEPOT}" target="_blank" rel="noopener">{t("code_source")}</a></div>',
-            unsafe_allow_html=True)
+afficher_bas_de_page()

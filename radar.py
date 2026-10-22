@@ -25,6 +25,7 @@ MODELE_RADAR = "nvidia/nemotron-3-super-120b-a12b"
 SOURCE_GEORISQUES = "https://georisques.gouv.fr/api/v1/gaspar/catnat"
 OFFICIEL = "officiel"
 NON_OFFICIEL = "non officiel, à vérifier"
+RAISON_CITATION = "la citation ne figure pas mot pour mot dans le résultat"
 
 DOSSIER_CACHE = Path(__file__).parent / "cache"
 DUREE_CACHE = timedelta(hours=24)
@@ -188,7 +189,7 @@ def _mentionne_commune(commune, resultat):
 def _affirmations_officielles(commune, recents):
     """Les affirmations « officiel » sont écrites par le code, directement depuis Géorisques."""
     if not recents:
-        return [{"texte": f"Aucun arrêté CatNat publié au Journal officiel depuis un an pour {commune}.",
+        return [{"texte": f"Aucun arrêté de catastrophe naturelle publié au Journal officiel depuis un an pour {commune}.",
                  "source": SOURCE_GEORISQUES, "statut": OFFICIEL, "niveau": "Géorisques"}]
     affirmations = []
     for a in recents:
@@ -197,8 +198,8 @@ def _affirmations_officielles(commune, recents):
         else:
             delai = f"délai en cours, {a['jours_restants']} jours restants"
         affirmations.append({
-            "texte": f"Arrêté « {a['type']} » (événement du {_format(a['debut_evenement'])} au "
-                     f"{_format(a['fin_evenement'])}) publié au JO le {_format(a['publication_jo'])} ; "
+            "texte": f"Arrêté de catastrophe naturelle « {a['type']} » (événement du {_format(a['debut_evenement'])} au "
+                     f"{_format(a['fin_evenement'])}) publié au Journal officiel le {_format(a['publication_jo'])} ; "
                      f"date limite de déclaration {_format(a['date_limite'])} : {delai}.",
             "source": SOURCE_GEORISQUES,
             "statut": OFFICIEL,
@@ -273,68 +274,89 @@ def analyser_situation(commune, arretes_georisques, resultats_tavily, modele=MOD
     messages = [{"role": "system", "content": CONSIGNES}, {"role": "user", "content": message}]
 
     tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    for essai in range(2):
-        texte, tokens_appel = appeler_nemotron(messages, modele=modele, temperature=0, max_tokens=8000)
-        for cle in tokens:
-            tokens[cle] += tokens_appel[cle]
-        try:
-            analyse = _extraire_json(texte)
+
+    def demander():
+        """Appelle l'IA et lit son JSON (un nouvel essai si la réponse n'est pas du JSON)."""
+        for essai in range(2):
+            texte, tokens_appel = appeler_nemotron(messages, modele=modele, temperature=0, max_tokens=8000)
+            for cle in tokens:
+                tokens[cle] += tokens_appel[cle]
+            try:
+                return _extraire_json(texte), texte
+            except ValueError:  # json.JSONDecodeError est aussi une ValueError
+                if essai == 1:
+                    raise
+                messages.extend([{"role": "assistant", "content": texte},
+                                 {"role": "user", "content": "Réponds uniquement avec l'objet JSON demandé."}])
+
+    def verifier(analyse):
+        """Vérifie l'analyse de l'IA ; renvoie (affirmations, rejetees, cas, corrections)."""
+        # 1. Vérifier les sources de l'IA : URL fournie, qui parle de la commune, citation recopiée à l'identique
+        # unquote : « %C3%A9 » et « é » désignent la même URL, l'IA écrit parfois l'un pour l'autre
+        resultats_par_url = {unquote(r["url"]): r for r in resultats_tavily}
+        affirmations = _affirmations_officielles(commune, recents)
+        rejetees = []
+        for aff in analyse.get("affirmations", []):
+            texte, source = aff.get("texte", ""), str(aff.get("source", "")).strip()
+            citation = simplifier(str(aff.get("citation", "")))
+            resultat = resultats_par_url.get(unquote(source))
+            if resultat:
+                source = resultat["url"]
+            if source == SOURCE_GEORISQUES:
+                raison = "les données Géorisques sont affichées par le code, pas par l'IA"
+            elif resultat is None:
+                raison = "cette URL ne fait pas partie des résultats Tavily"
+            elif not _mentionne_commune(commune, resultat):
+                raison = "ce résultat ne mentionne pas la commune"
+            elif len(citation) < LONGUEUR_MIN_CITATION or citation not in simplifier(resultat["titre"] + " " + resultat["contenu"]):
+                raison = RAISON_CITATION
+            else:
+                affirmations.append({"texte": texte, "citation": aff.get("citation", ""), "source": source,
+                                     "statut": NON_OFFICIEL, "niveau": niveau_source(source, commune)})
+                continue
+            rejetees.append({"texte": texte, "source": source, "raison": raison})
+
+        # 2. Vérifier la cohérence du cas avec les données (le code a le dernier mot)
+        cas = str(analyse.get("cas", "D")).strip().upper()[:1]
+        repli = "E" if depasses_recents else "D"  # cas retenu si celui de l'IA n'est pas justifié
+        corrections = []
+        if cas not in CAS:
+            corrections.append(f"cas « {cas} » inconnu, remplacé par {repli}")
+            cas = repli
+        if en_cours:
+            if cas != "A":
+                corrections.append(f"cas {cas} remplacé par A : Géorisques contient un arrêté dont le délai est en cours")
+                cas = "A"
+        elif cas == "A":
+            corrections.append(f"cas A impossible : aucun arrêté Géorisques avec délai en cours, remplacé par {repli}")
+            cas = repli
+        elif cas in MOT_EXIGE and not any(_justifie(cas, a, commune) for a in affirmations):
+            corrections.append(f"cas {cas} remplacé par {repli} : aucune citation vérifiée d'un site officiel local "
+                               f"ou de presse ne contient « {MOT_EXIGE[cas]} » en parlant de {commune}")
+            cas = repli
+        elif cas == "E" and not depasses_recents:
+            corrections.append("cas E impossible : aucun arrêté Géorisques des douze derniers mois, remplacé par D")
+            cas = "D"
+        elif cas == "D" and depasses_recents:
+            corrections.append("cas D remplacé par E : Géorisques contient un arrêté récent dont le délai est dépassé")
+            cas = "E"
+        return affirmations, rejetees, cas, corrections
+
+    # Si une citation mal recopiée fait corriger le cas, l'IA a droit à un second essai :
+    # on lui dit quelles citations ne figurent pas mot pour mot dans les extraits.
+    for tentative in range(2):
+        analyse, reponse = demander()
+        affirmations, rejetees, cas, corrections = verifier(analyse)
+        citations_fausses = [r for r in rejetees if r["raison"] == RAISON_CITATION]
+        if tentative == 1 or not (corrections and citations_fausses):
             break
-        except ValueError:  # json.JSONDecodeError est aussi une ValueError
-            if essai == 1:
-                raise
-            messages += [{"role": "assistant", "content": texte},
-                         {"role": "user", "content": "Réponds uniquement avec l'objet JSON demandé."}]
-
-    # 1. Vérifier les sources de l'IA : URL fournie, qui parle de la commune, citation recopiée à l'identique
-    # unquote : « %C3%A9 » et « é » désignent la même URL, l'IA écrit parfois l'un pour l'autre
-    resultats_par_url = {unquote(r["url"]): r for r in resultats_tavily}
-    affirmations = _affirmations_officielles(commune, recents)
-    rejetees = []
-    for aff in analyse.get("affirmations", []):
-        texte, source = aff.get("texte", ""), str(aff.get("source", "")).strip()
-        citation = simplifier(str(aff.get("citation", "")))
-        resultat = resultats_par_url.get(unquote(source))
-        if resultat:
-            source = resultat["url"]
-        if source == SOURCE_GEORISQUES:
-            raison = "les données Géorisques sont affichées par le code, pas par l'IA"
-        elif resultat is None:
-            raison = "cette URL ne fait pas partie des résultats Tavily"
-        elif not _mentionne_commune(commune, resultat):
-            raison = "ce résultat ne mentionne pas la commune"
-        elif len(citation) < LONGUEUR_MIN_CITATION or citation not in simplifier(resultat["titre"] + " " + resultat["contenu"]):
-            raison = "la citation ne figure pas mot pour mot dans le résultat"
-        else:
-            affirmations.append({"texte": texte, "citation": aff.get("citation", ""), "source": source,
-                                 "statut": NON_OFFICIEL, "niveau": niveau_source(source, commune)})
-            continue
-        rejetees.append({"texte": texte, "source": source, "raison": raison})
-
-    # 2. Vérifier la cohérence du cas avec les données (le code a le dernier mot)
-    cas = str(analyse.get("cas", "D")).strip().upper()[:1]
-    repli = "E" if depasses_recents else "D"  # cas retenu si celui de l'IA n'est pas justifié
-    corrections = []
-    if cas not in CAS:
-        corrections.append(f"cas « {cas} » inconnu, remplacé par {repli}")
-        cas = repli
-    if en_cours:
-        if cas != "A":
-            corrections.append(f"cas {cas} remplacé par A : Géorisques contient un arrêté dont le délai est en cours")
-            cas = "A"
-    elif cas == "A":
-        corrections.append(f"cas A impossible : aucun arrêté Géorisques avec délai en cours, remplacé par {repli}")
-        cas = repli
-    elif cas in MOT_EXIGE and not any(_justifie(cas, a, commune) for a in affirmations):
-        corrections.append(f"cas {cas} remplacé par {repli} : aucune citation vérifiée d'un site officiel local "
-                           f"ou de presse ne contient « {MOT_EXIGE[cas]} » en parlant de {commune}")
-        cas = repli
-    elif cas == "E" and not depasses_recents:
-        corrections.append("cas E impossible : aucun arrêté Géorisques des douze derniers mois, remplacé par D")
-        cas = "D"
-    elif cas == "D" and depasses_recents:
-        corrections.append("cas D remplacé par E : Géorisques contient un arrêté récent dont le délai est dépassé")
-        cas = "E"
+        messages += [
+            {"role": "assistant", "content": reponse},
+            {"role": "user", "content": "Ces citations ne figurent pas mot pour mot dans les extraits fournis : "
+                                        + " ; ".join(f"« {r['texte']} » ({r['source']})" for r in citations_fausses)
+                                        + ". Pour chaque affirmation, recopie à l'identique un passage continu de "
+                                          "l'extrait, sans le couper ni le résumer, puis renvoie l'objet JSON complet."},
+        ]
 
     explication = analyse.get("explication", "")
     if corrections:

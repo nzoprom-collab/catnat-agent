@@ -132,15 +132,6 @@ def inventaire_en_tableau(inventaire):
     return "\n".join([formater(entetes), separateur] + [formater(l) for l in lignes])
 
 
-def inventaire_en_description(inventaire):
-    """Résumé de l'inventaire, sans numéro de photo, pour que l'IA rédige le paragraphe des dégâts."""
-    return "\n".join(
-        f"- {l['zone']} : {l['objet']} – {l['dommage']}"
-        + ("" if l["certitude"] == CERTAIN else " (probable, à confirmer)")
-        for l in inventaire
-    )
-
-
 if __name__ == "__main__":
     from catnat import recuperer_arretes_catnat, trouver_code_insee
     from lettre import generer_lettre
