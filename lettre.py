@@ -3,71 +3,62 @@
 Règle d'or : l'IA ne recopie jamais un fait (commune, dates, noms...). Elle écrit des étiquettes
 comme {{DATE_JO}} et c'est le code qui les remplace par les vraies valeurs. Le brouillon de l'IA
 est vérifié avant remplacement : s'il contient une date ou un chiffre inventé, il est refusé.
+L'en-tête et la fin de la lettre sont entièrement écrits par le code ; l'IA ne rédige que le corps.
 """
 
 import re
 from datetime import date
 
-from catnat import _format, calculer_delai_declaration
+from catnat import _format, calculer_delai_declaration, simplifier
 from llm import appeler_nemotron
 
 MODELE_LETTRE = "nvidia/nemotron-3-super-120b-a12b"
 A_COMPLETER = "[À COMPLÉTER]"
 NOMBRE_ESSAIS = 3
+NOMBRE_PARAGRAPHES = 3
 
-# Étiquettes que l'IA doit obligatoirement utiliser, puis celles qu'elle peut utiliser
-ETIQUETTES_OBLIGATOIRES = [
-    "NOM", "ADRESSE", "ASSUREUR", "ADRESSE_ASSUREUR", "NUMERO_CONTRAT", "COMMUNE",
-    "TYPE_CATASTROPHE", "DATE_DEBUT", "DATE_FIN", "DATE_JO", "REFERENCE_ARRETE", "DATE_DU_JOUR",
-]
-ETIQUETTES_FACULTATIVES = ["DATE_LIMITE", "ARTICLE_LOI"]
+# Étiquettes que l'IA doit obligatoirement utiliser dans le corps, puis celles qu'elle peut utiliser
+ETIQUETTES_OBLIGATOIRES = ["ADRESSE", "TYPE_CATASTROPHE", "DATE_DEBUT", "DATE_FIN", "COMMUNE"]
+ETIQUETTES_FACULTATIVES = ["DATE_JO", "REFERENCE_ARRETE", "DATE_LIMITE", "ARTICLE_LOI", "NUMERO_CONTRAT", "ASSUREUR"]
 
 MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
         "septembre", "octobre", "novembre", "décembre"]
 
-# Textes que la lettre doit contenir mot pour mot
-TEXTES_OBLIGATOIRES = [
-    "Madame, Monsieur,",
-    "par {{TYPE_CATASTROPHE}}",
-    "expert",
-    "Pièce jointe : copie de l'arrêté",
-]
+# Textes que le corps doit contenir mot pour mot, et ceux que le code écrit déjà lui-même
+TEXTES_OBLIGATOIRES = ["par {{TYPE_CATASTROPHE}}", "expert"]
+TEXTES_INTERDITS = ["Objet :", "Madame, Monsieur", "Veuillez agréer", "Pièce jointe", "sinistré"]
 
 # Premiers mots des types Géorisques qui sont féminins, ou singuliers bien que finissant par « s »
 MOTS_FEMININS = {"sécheresse", "tempête", "crue", "submersion", "grêle", "lave", "coulée", "inondation"}
 MOTS_SINGULIERS_EN_S = {"poids", "glissement"}
 
-CONSIGNES = f"""Tu rédiges en français une lettre de déclaration de sinistre catastrophe naturelle,
-envoyée par un particulier à son assureur en lettre recommandée avec accusé de réception.
+CONSIGNES = f"""Tu rédiges en français le corps d'une lettre de déclaration de sinistre catastrophe
+naturelle, envoyée par un particulier à son assureur. L'en-tête, l'objet, « Madame, Monsieur, »,
+la formule de politesse, la pièce jointe et la signature sont ajoutés par ailleurs : ne les écris pas.
 
 Règles absolues :
-- N'écris JAMAIS toi-même un nom, une adresse, une commune, une date, une référence ou un numéro.
+- La lettre est écrite à la première personne, au nom du sinistré (« je »). N'écris jamais « le sinistré ».
+- N'écris JAMAIS toi-même une adresse, une commune, une date, une référence ou un numéro.
   Utilise à la place ces étiquettes, écrites exactement ainsi, le code les remplira :
   {", ".join("{{" + e + "}}" for e in ETIQUETTES_OBLIGATOIRES)} (toutes obligatoires)
   {", ".join("{{" + e + "}}" for e in ETIQUETTES_FACULTATIVES)} (facultatives ; {{{{ARTICLE_LOI}}}} = l'article du Code des assurances)
-- Aucun chiffre dans ta lettre, aucun nom de mois. N'invente aucun montant, aucune date, aucun fait.
-- Pour les dégâts, reformule uniquement ceux décrits par le sinistré, sans en ajouter.
+- Aucun chiffre, aucun nom de mois. N'invente aucun montant, aucune date, aucun fait.
 - N'affirme jamais que la déclaration est faite dans les délais ou hors délai.
 - N'affirme pas ce que le sinistré possède ou a fait (photos, devis, factures, expertise...).
 - {{{{TYPE_CATASTROPHE}}}} contient déjà son article (exemple : « les inondations ») : écris
   toujours « causé par {{{{TYPE_CATASTROPHE}}}} », sans rien ajouter devant.
-- Mise en page, dans cet ordre :
-  expéditeur ; destinataire ({{{{ASSUREUR}}}} puis {{{{ADRESSE_ASSUREUR}}}}) ;
-  « Lettre recommandée avec accusé de réception » ; lieu et date ({{{{COMMUNE}}}}, le {{{{DATE_DU_JOUR}}}}) ;
-  cette ligne d'objet, recopiée telle quelle sur une seule ligne et sans guillemets :
-  Objet : Déclaration de sinistre catastrophe naturelle – arrêté {{{{REFERENCE_ARRETE}}}} publié au Journal officiel du {{{{DATE_JO}}}} – contrat {{{{NUMERO_CONTRAT}}}}
-  la ligne « Madame, Monsieur, » seule ;
-  premier paragraphe : une phrase complète qui déclare le sinistre subi à {{{{ADRESSE}}}}, causé par
-  {{{{TYPE_CATASTROPHE}}}} du {{{{DATE_DEBUT}}}} au {{{{DATE_FIN}}}} à {{{{COMMUNE}}}}, événement reconnu
-  état de catastrophe naturelle par l'arrêté cité en objet ;
-  deuxième paragraphe : les dégâts ;
-  troisième paragraphe : le sinistré tient les justificatifs à disposition (sans les énumérer),
-  demande la prise en charge au titre de la garantie catastrophes naturelles et demande le
-  passage d'un expert pour constater les dommages ;
-  formule de politesse ;
-  la ligne « Pièce jointe : copie de l'arrêté » seule ;
-  signature ({{{{NOM}}}}).
-- Réponds uniquement avec la lettre, en texte brut, sans commentaire avant ou après."""
+
+Écris exactement {NOMBRE_PARAGRAPHES} paragraphes, séparés par une ligne vide :
+1. Une phrase complète qui déclare le sinistre subi à {{{{ADRESSE}}}}, causé par {{{{TYPE_CATASTROPHE}}}}
+   du {{{{DATE_DEBUT}}}} au {{{{DATE_FIN}}}} à {{{{COMMUNE}}}}, événement reconnu état de catastrophe
+   naturelle par l'arrêté cité en objet.
+2. Une vraie phrase rédigée (avec un verbe, par exemple « Ces intempéries ont entraîné... ») qui décrit
+   les dégâts. Reprends chacun des dégâts décrits par le sinistré, sans en ajouter, sans en retirer,
+   sans les aggraver. Ne recopie pas sa description telle quelle.
+3. « Je » tiens les justificatifs à disposition (sans les énumérer), demande la prise en charge
+   au titre de la garantie catastrophes naturelles et demande le passage d'un expert pour constater
+   les dommages.
+Réponds uniquement avec ces paragraphes, en texte brut, sans commentaire avant ou après."""
 
 
 def _valeur(texte):
@@ -88,6 +79,11 @@ def type_avec_article(libelle):
     return ("la " if premier_mot in MOTS_FEMININS else "le ") + texte
 
 
+def _paragraphes(texte):
+    """Découpe le texte de l'IA en paragraphes (une ligne non vide = un paragraphe)."""
+    return [ligne.strip() for ligne in texte.splitlines() if ligne.strip()]
+
+
 def verifier_brouillon(brouillon, description_degats):
     """Renvoie la liste des problèmes du brouillon de l'IA (liste vide = brouillon accepté)."""
     problemes = []
@@ -96,6 +92,14 @@ def verifier_brouillon(brouillon, description_degats):
     for texte in TEXTES_OBLIGATOIRES:
         if texte not in brouillon_normalise:
             problemes.append(f"texte obligatoire absent : « {texte} »")
+    for texte in TEXTES_INTERDITS:
+        if texte in brouillon_normalise:
+            problemes.append(f"« {texte} » est déjà écrit par le code, ne l'écris pas")
+    paragraphes = _paragraphes(brouillon)
+    if len(paragraphes) != NOMBRE_PARAGRAPHES:
+        problemes.append(f"{len(paragraphes)} paragraphes au lieu de {NOMBRE_PARAGRAPHES}")
+    elif description_degats and simplifier(paragraphes[1]) == simplifier(description_degats):
+        problemes.append("le paragraphe des dégâts recopie la description au lieu de la rédiger")
     trouvees = set(re.findall(r"\{\{([A-Z_]+)\}\}", brouillon))
     inconnues = trouvees - set(ETIQUETTES_OBLIGATOIRES) - set(ETIQUETTES_FACULTATIVES)
     if inconnues:
@@ -181,13 +185,28 @@ def generer_lettre(arrete, sinistre):
         # On renvoie ses erreurs à l'IA pour qu'elle corrige
         messages += [
             {"role": "assistant", "content": brouillon},
-            {"role": "user", "content": "Ta lettre ne respecte pas les règles : " + " ; ".join(problemes)
-                                        + ". Réécris la lettre complète en corrigeant ces points."},
+            {"role": "user", "content": "Ton texte ne respecte pas les règles : " + " ; ".join(problemes)
+                                        + ". Réécris les paragraphes en corrigeant ces points."},
         ]
     else:
         raise ValueError(f"Lettre refusée après {NOMBRE_ESSAIS} essais : {' ; '.join(problemes)}")
 
-    lettre = brouillon
+    # En-tête et fin de lettre : écrits par le code, avec une ligne vide entre chaque bloc
+    v = valeurs
+    blocs = [
+        f"{v['NOM']}\n{v['ADRESSE']}",
+        f"{v['ASSUREUR']}\n{v['ADRESSE_ASSUREUR']}",
+        "Lettre recommandée avec accusé de réception",
+        f"{v['COMMUNE']}, le {v['DATE_DU_JOUR']}",
+        f"Objet : Déclaration de sinistre catastrophe naturelle – arrêté {v['REFERENCE_ARRETE']} "
+        f"publié au Journal officiel du {v['DATE_JO']} – contrat {v['NUMERO_CONTRAT']}",
+        "Madame, Monsieur,",
+        *_paragraphes(brouillon),
+        "Veuillez agréer, Madame, Monsieur, l'expression de mes salutations distinguées.",
+        "Pièce jointe : copie de l'arrêté",
+        v["NOM"],
+    ]
+    lettre = "\n\n".join(blocs)
     for etiquette, valeur in valeurs.items():
         lettre = lettre.replace("{{" + etiquette + "}}", valeur)
 

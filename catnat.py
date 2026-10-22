@@ -1,5 +1,7 @@
 """Arrêtés de catastrophe naturelle d'une commune, à partir des API publiques de l'État (sans IA)."""
 
+import re
+import unicodedata
 from datetime import date, datetime, timedelta
 
 import requests
@@ -75,6 +77,12 @@ def calculer_delai_declaration(arrete, aujourd_hui=None):
 
 def _format(d):
     return d.strftime("%d/%m/%Y") if d else "?"
+
+
+def simplifier(texte):
+    """« Saint-Aunès » devient « saint aunes » : sans accents, ponctuation ni majuscules, pour comparer."""
+    sans_accents = unicodedata.normalize("NFD", texte).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", " ", sans_accents.lower()).strip()
 
 
 if __name__ == "__main__":
