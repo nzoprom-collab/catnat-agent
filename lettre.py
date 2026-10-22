@@ -9,8 +9,13 @@ Deux modes :
 - avec arrêté (cas A ou E du radar) : les faits viennent de l'arrêté Géorisques ;
 - sans arrêté (cas B, C ou D) : le sinistré déclare dès maintenant ; le type et les dates de
   l'événement sont ceux qu'il a saisis, et la lettre n'affirme jamais que l'événement est reconnu.
+
+L'IA répond en JSON avec exactement 3 champs (un par paragraphe) : le code assemble la lettre.
+Si l'IA échoue 3 fois (ou ne répond pas), le code écrit une lettre de secours à partir d'un
+modèle fixe : l'utilisateur obtient toujours une lettre, jamais une erreur.
 """
 
+import json
 import re
 from datetime import date
 
@@ -20,8 +25,9 @@ from llm import appeler_nemotron
 MODELE_LETTRE = "nvidia/nemotron-3-super-120b-a12b"
 A_COMPLETER = "[À COMPLÉTER]"
 NOMBRE_ESSAIS = 3
-NOMBRE_PARAGRAPHES = 3
 MAX_PHRASES_DEGATS = 3
+# Les 3 champs du JSON renvoyé par l'IA, dans l'ordre de la lettre
+CHAMPS_LETTRE = ["paragraphe_declaration", "paragraphe_degats", "paragraphe_demande"]
 
 # Annexe (écrite par le code) : partagée avec pdf.py et app.py
 SEPARATEUR_ANNEXE = "-" * 40
@@ -40,8 +46,8 @@ ETIQUETTES_FACULTATIVES = ["DATE_JO", "REFERENCE_ARRETE", "DATE_LIMITE"] + ETIQU
 MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
         "septembre", "octobre", "novembre", "décembre"]
 
-# Textes que le corps doit contenir mot pour mot, et ceux que le code écrit déjà lui-même
-TEXTES_OBLIGATOIRES = ["par {{TYPE_CATASTROPHE}}", "expert"]
+# Textes que chaque paragraphe doit contenir mot pour mot, et ceux que le code écrit déjà lui-même
+TEXTES_OBLIGATOIRES = {"paragraphe_declaration": ["par {{TYPE_CATASTROPHE}}"], "paragraphe_demande": ["expert"]}
 # « énumérer » : l'IA a déjà recopié une consigne (« sans les énumérer ») dans la lettre
 TEXTES_INTERDITS = ["Objet :", "Madame, Monsieur", "Veuillez agréer", "Pièce jointe", "sinistré", "énumérer"]
 # Sans arrêté, la lettre ne doit jamais laisser croire que l'événement est déjà reconnu
@@ -57,10 +63,15 @@ def _obligatoires(une_seule_date):
     return [e for e in ETIQUETTES_OBLIGATOIRES if not (une_seule_date and e == "DATE_FIN")]
 
 
+def _periode(une_seule_date):
+    """« le {{DATE_DEBUT}} » pour un événement d'un seul jour, sinon « du ... au ... »."""
+    return "le {{DATE_DEBUT}}" if une_seule_date else "du {{DATE_DEBUT}} au {{DATE_FIN}}"
+
+
 def _consignes(avec_arrete, une_seule_date=False):
     """Consignes données à l'IA ; seul le premier paragraphe change selon qu'il y a un arrêté ou non."""
     facultatives = ETIQUETTES_FACULTATIVES if avec_arrete else ETIQUETTES_FACULTATIVES_SANS_ARRETE
-    periode = "le {{DATE_DEBUT}}" if une_seule_date else "du {{DATE_DEBUT}} au {{DATE_FIN}}"
+    periode = _periode(une_seule_date)
     if avec_arrete:
         paragraphe_1 = (
             "Une phrase complète qui déclare le sinistre subi à {{ADRESSE}}, causé par {{TYPE_CATASTROPHE}}\n"
@@ -90,17 +101,19 @@ Règles absolues :
 - {{{{TYPE_CATASTROPHE}}}} contient déjà son article (exemple : « les inondations ») : écris
   toujours « causé par {{{{TYPE_CATASTROPHE}}}} », sans rien ajouter devant.
 
-Écris exactement {NOMBRE_PARAGRAPHES} paragraphes, séparés par une ligne vide :
-1. {paragraphe_1}
-2. Au maximum {MAX_PHRASES_DEGATS} phrases courtes, avec un verbe, qui RÉSUMENT les dégâts pièce par pièce
-   (par exemple « Dans le salon, ... »). Reprends les dégâts fournis sans en ajouter, sans les
-   aggraver et sans inventer de lien de cause entre eux. Ne recopie pas la liste telle quelle.
-   Pour ceux marqués « probable, à confirmer », emploie une formulation prudente (« semble »).
-   Si un inventaire est joint en annexe, termine par UN SEUL renvoi à l'annexe.
-3. « Je » tiens les justificatifs à votre disposition (ne dresse pas leur liste), demande la prise en charge
-   au titre de la garantie catastrophes naturelles et demande le passage d'un expert pour constater
-   les dommages.
-Réponds uniquement avec ces paragraphes, en texte brut, sans commentaire avant ou après."""
+Réponds uniquement avec un objet JSON, sans texte avant ou après, qui contient exactement ces
+3 champs. Chaque champ est UN SEUL paragraphe, sans retour à la ligne :
+{{"paragraphe_declaration": "...", "paragraphe_degats": "...", "paragraphe_demande": "..."}}
+
+- paragraphe_declaration : {paragraphe_1}
+- paragraphe_degats : au maximum {MAX_PHRASES_DEGATS} phrases courtes, avec un verbe, qui RÉSUMENT les
+   dégâts pièce par pièce (par exemple « Dans le salon, ... »). Reprends les dégâts fournis sans en
+   ajouter, sans les aggraver et sans inventer de lien de cause entre eux. Ne recopie pas la liste
+   telle quelle. Pour ceux marqués « probable, à confirmer », emploie une formulation prudente
+   (« semble »). Si un inventaire est joint en annexe, termine par UN SEUL renvoi à l'annexe.
+- paragraphe_demande : « je » tiens les justificatifs à votre disposition (ne dresse pas leur liste),
+   demande la prise en charge au titre de la garantie catastrophes naturelles et demande le passage
+   d'un expert pour constater les dommages."""
 
 
 def _valeur(texte):
@@ -128,35 +141,52 @@ def type_avec_article(libelle):
     return ("la " if premier_mot in MOTS_FEMININS else "le ") + texte
 
 
-def _paragraphes(texte):
-    """Découpe le texte de l'IA en paragraphes (une ligne non vide = un paragraphe)."""
-    return [ligne.strip() for ligne in texte.splitlines() if ligne.strip()]
+def _un_seul_paragraphe(texte):
+    """Fusionne un texte écrit sur plusieurs lignes en un seul paragraphe (au lieu de le refuser)."""
+    return " ".join(ligne.strip() for ligne in texte.splitlines() if ligne.strip())
 
 
-def verifier_brouillon(brouillon, description_degats, avec_arrete=True, avec_inventaire=False, une_seule_date=False):
-    """Renvoie la liste des problèmes du brouillon de l'IA (liste vide = brouillon accepté)."""
+def lire_reponse(reponse):
+    """Lit le JSON de l'IA. Renvoie (les 3 paragraphes dans l'ordre, None) ou (None, problème)."""
+    debut, fin = reponse.find("{"), reponse.rfind("}")
+    try:
+        # strict=False : accepte un vrai retour à la ligne à l'intérieur d'un champ
+        donnees = json.loads(reponse[debut:fin + 1], strict=False) if debut != -1 else None
+    except ValueError:
+        donnees = None
+    if not isinstance(donnees, dict):
+        return None, "la réponse n'est pas un objet JSON valide"
+    manquants = [c for c in CHAMPS_LETTRE if not isinstance(donnees.get(c), str) or not donnees[c].strip()]
+    if manquants:
+        return None, f"champs JSON manquants ou vides : {', '.join(manquants)}"
+    # Un éventuel champ en plus est ignoré : seuls les 3 champs demandés entrent dans la lettre
+    paragraphes = [_un_seul_paragraphe(donnees[c]) for c in CHAMPS_LETTRE]
+    return [p[0].upper() + p[1:] for p in paragraphes], None  # « je tiens... » -> « Je tiens... »
+
+
+def verifier_brouillon(paragraphes, description_degats, avec_arrete=True, avec_inventaire=False, une_seule_date=False):
+    """Renvoie la liste des problèmes des 3 paragraphes de l'IA (liste vide = brouillon accepté)."""
     problemes = []
     # L'IA écrit parfois l'apostrophe typographique ’ : on la ramène à ' avant de comparer
-    brouillon_normalise = brouillon.replace("’", "'")
-    for texte in TEXTES_OBLIGATOIRES:
-        if texte not in brouillon_normalise:
-            problemes.append(f"texte obligatoire absent : « {texte} »")
+    champs = {c: p.replace("’", "'") for c, p in zip(CHAMPS_LETTRE, paragraphes)}
+    brouillon = "\n\n".join(champs.values())
+    for champ, textes in TEXTES_OBLIGATOIRES.items():
+        for texte in textes:
+            if texte not in champs[champ]:
+                problemes.append(f"texte obligatoire absent de {champ} : « {texte} »")
     interdits = TEXTES_INTERDITS + ([] if avec_arrete else TEXTES_INTERDITS_SANS_ARRETE)
-    for texte in interdits:
-        if texte in brouillon_normalise:
-            problemes.append(f"« {texte} » ne doit pas apparaître dans le corps de la lettre")
-    paragraphes = _paragraphes(brouillon)
-    if len(paragraphes) != NOMBRE_PARAGRAPHES:
-        problemes.append(f"{len(paragraphes)} paragraphes au lieu de {NOMBRE_PARAGRAPHES}")
-    else:
-        degats = paragraphes[1]
-        if description_degats and simplifier(degats) == simplifier(description_degats):
-            problemes.append("le paragraphe des dégâts recopie la description au lieu de la rédiger")
-        nombre_phrases = len(re.findall(r"[.!?](?:\s|$)", degats))
-        if nombre_phrases > MAX_PHRASES_DEGATS:
-            problemes.append(f"le paragraphe des dégâts fait {nombre_phrases} phrases (maximum {MAX_PHRASES_DEGATS})")
-    if avec_inventaire and brouillon_normalise.lower().count("annexe") != 1:
-        problemes.append("il faut exactement un renvoi à l'annexe")
+    for champ, paragraphe in champs.items():
+        for texte in interdits:
+            if texte in paragraphe:
+                problemes.append(f"« {texte} » ne doit pas apparaître dans {champ}")
+    degats = champs["paragraphe_degats"]
+    if description_degats and simplifier(degats) == simplifier(description_degats):
+        problemes.append("le paragraphe des dégâts recopie la description au lieu de la rédiger")
+    nombre_phrases = len(re.findall(r"[.!?](?:\s|$)", degats))
+    if nombre_phrases > MAX_PHRASES_DEGATS:
+        problemes.append(f"le paragraphe des dégâts fait {nombre_phrases} phrases (maximum {MAX_PHRASES_DEGATS})")
+    if avec_inventaire and (brouillon.lower().count("annexe") != 1 or "annexe" not in degats.lower()):
+        problemes.append("il faut exactement un renvoi à l'annexe, dans paragraphe_degats")
     obligatoires = _obligatoires(une_seule_date)
     autorisees = set(ETIQUETTES_OBLIGATOIRES) | set(
         ETIQUETTES_FACULTATIVES if avec_arrete else ETIQUETTES_FACULTATIVES_SANS_ARRETE)
@@ -177,6 +207,39 @@ def verifier_brouillon(brouillon, description_degats, avec_arrete=True, avec_inv
     if mois_inventes:
         problemes.append(f"noms de mois écrits par l'IA : {', '.join(mois_inventes)}")
     return problemes
+
+
+def paragraphes_de_secours(avec_arrete, une_seule_date, description_sinistre, inventaire):
+    """Les 3 paragraphes écrits entièrement par le code (modèle fixe), si l'IA échoue.
+
+    Mêmes étiquettes que pour l'IA : le code les remplace ensuite par les vraies valeurs.
+    Les dégâts reprennent uniquement les mots du sinistré et les pièces de l'inventaire qu'il a relu.
+    """
+    declaration = f"Je déclare le sinistre subi à {{{{ADRESSE}}}}, causé par {{{{TYPE_CATASTROPHE}}}} " \
+                  f"{_periode(une_seule_date)} à {{{{COMMUNE}}}}"
+    if avec_arrete:
+        declaration += ", événement reconnu état de catastrophe naturelle par l'arrêté cité en objet."
+    else:
+        declaration += ". Je le déclare dès maintenant, sans attendre la publication d'un éventuel " \
+                       "arrêté de catastrophe naturelle."
+
+    phrases = []
+    description = _un_seul_paragraphe(description_sinistre or "")
+    if description:
+        if description[1:2].islower():  # « Eau et boue... » -> « eau et boue... » après les deux-points
+            description = description[0].lower() + description[1:]
+        phrases.append("J'ai constaté les dégâts suivants : " + description.rstrip(" .") + ".")
+    if inventaire:
+        pieces = list(dict.fromkeys(l["zone"] for l in inventaire if l["zone"] != A_COMPLETER))
+        if pieces:
+            phrases.append(f"Les pièces touchées sont : {', '.join(pieces)}.")
+        phrases.append("Le détail des dommages figure dans l'inventaire joint en annexe.")
+    if not phrases:
+        phrases.append(f"J'ai constaté les dégâts suivants : {A_COMPLETER}.")
+
+    demande = ("Je tiens les justificatifs à votre disposition. Je demande la prise en charge de ces dommages "
+               "au titre de la garantie catastrophes naturelles, ainsi que le passage d'un expert pour les constater.")
+    return [declaration, " ".join(phrases), demande]
 
 
 def checklist_pieces(arrete_calcule, reference_arrete):
@@ -210,7 +273,9 @@ def generer_lettre(arrete, sinistre, inventaire=None):
     Toute information absente devient [À COMPLÉTER].
     `inventaire` (facultatif) : lignes renvoyées par photos.analyser_photos() (éventuellement
     corrigées par le sinistré). Elles servent à décrire les dégâts et sont ajoutées en annexe.
-    Renvoie un dictionnaire : lettre, checklist, delai_depasse, jours_restants, tokens, essais, rejets.
+    Renvoie un dictionnaire : lettre, checklist, delai_depasse, jours_restants, tokens, essais, rejets,
+    secours (True si la lettre vient du modèle fixe du code, parce que l'IA a échoué).
+    Ne lève jamais d'erreur à cause de l'IA : dans le pire des cas, c'est la lettre de secours.
     """
     # Import ici pour que lettre.py fonctionne aussi sans photos
     from photos import inventaire_en_description, inventaire_en_tableau
@@ -261,25 +326,36 @@ def generer_lettre(arrete, sinistre, inventaire=None):
     ]
     tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     rejets = []  # raisons pour lesquelles un brouillon a été refusé
+    paragraphes, essais = None, 0
 
-    for essai in range(1, NOMBRE_ESSAIS + 1):
-        brouillon, tokens_appel = appeler_nemotron(
-            messages, modele=MODELE_LETTRE, temperature=0.3, max_tokens=6000
-        )
+    for essais in range(1, NOMBRE_ESSAIS + 1):
+        try:
+            reponse, tokens_appel = appeler_nemotron(
+                messages, modele=MODELE_LETTRE, temperature=0.3, max_tokens=6000
+            )
+        except Exception as erreur:  # IA indisponible, budget de tokens épuisé... : lettre de secours
+            rejets.append(f"appel à l'IA impossible : {erreur}")
+            break
         for cle in tokens:
             tokens[cle] += tokens_appel[cle]
-        problemes = verifier_brouillon(brouillon, description, avec_arrete, bool(inventaire), une_seule_date)
+        paragraphes, probleme = lire_reponse(reponse)
+        problemes = [probleme] if probleme else verifier_brouillon(
+            paragraphes, description, avec_arrete, bool(inventaire), une_seule_date)
         if not problemes:
             break
+        paragraphes = None
         rejets.append(" ; ".join(problemes))
         # On renvoie ses erreurs à l'IA pour qu'elle corrige
         messages += [
-            {"role": "assistant", "content": brouillon},
-            {"role": "user", "content": "Ton texte ne respecte pas les règles : " + " ; ".join(problemes)
-                                        + ". Réécris les paragraphes en corrigeant ces points."},
+            {"role": "assistant", "content": reponse},
+            {"role": "user", "content": "Ta réponse ne respecte pas les règles : " + " ; ".join(problemes)
+                                        + ". Renvoie l'objet JSON corrigé, avec les 3 champs."},
         ]
-    else:
-        raise ValueError(f"Lettre refusée après {NOMBRE_ESSAIS} essais : {' ; '.join(problemes)}")
+
+    secours = paragraphes is None
+    if secours:
+        paragraphes = paragraphes_de_secours(avec_arrete, une_seule_date, sinistre.get("description_degats"),
+                                             inventaire)
 
     # En-tête et fin de lettre : écrits par le code, avec une ligne vide entre chaque bloc
     v = valeurs
@@ -287,7 +363,7 @@ def generer_lettre(arrete, sinistre, inventaire=None):
         objet = (f"Objet : Déclaration de sinistre catastrophe naturelle – arrêté {v['REFERENCE_ARRETE']} "
                  f"publié au Journal officiel du {v['DATE_JO']} – contrat {v['NUMERO_CONTRAT']}")
     else:
-        periode = v["DATE_DEBUT"] if une_seule_date else f"{v['DATE_DEBUT']} au {v['DATE_FIN']}"
+        periode = v["DATE_DEBUT"] if une_seule_date else f"{v['DATE_DEBUT']} au {v['DATE_FIN']}"  # après « du »
         objet = (f"Objet : Déclaration de sinistre – événement du {periode} à {v['COMMUNE']} "
                  f"– contrat {v['NUMERO_CONTRAT']}")
     pieces = (["copie de l'arrêté"] if avec_arrete else []) + (
@@ -299,7 +375,7 @@ def generer_lettre(arrete, sinistre, inventaire=None):
         f"{v['COMMUNE']}, le {v['DATE_DU_JOUR']}",
         objet,
         "Madame, Monsieur,",
-        *_paragraphes(brouillon),
+        *paragraphes,
         "Veuillez agréer, Madame, Monsieur, l'expression de mes salutations distinguées.",
     ]
     if pieces:
@@ -324,8 +400,9 @@ def generer_lettre(arrete, sinistre, inventaire=None):
         "delai_depasse": calcul["depasse"] if calcul else None,
         "jours_restants": calcul["jours_restants"] if calcul else None,
         "tokens": tokens,
-        "essais": essai,
+        "essais": essais,
         "rejets": rejets,
+        "secours": secours,
     }
 
 
@@ -356,6 +433,8 @@ if __name__ == "__main__":
         print(f"  [ ] {piece}")
     for numero, raison in enumerate(resultat["rejets"], start=1):
         print(f"\nBrouillon n°{numero} refusé par la vérification : {raison}")
+    if resultat["secours"]:
+        print("\nVersion simplifiée : l'IA a échoué, la lettre vient du modèle fixe du code.")
     if resultat["delai_depasse"]:
         print(f"\nATTENTION : délai de déclaration dépassé depuis {-resultat['jours_restants']} jours.")
     t = resultat["tokens"]

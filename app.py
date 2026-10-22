@@ -1,4 +1,4 @@
-"""CatNat Copilot : interface web (Streamlit) pour les sinistrés d'une catastrophe naturelle en France.
+"""30 Days : interface web (Streamlit) pour les sinistrés d'une catastrophe naturelle en France.
 
 Lancer :  .venv/bin/streamlit run app.py
 
@@ -49,7 +49,7 @@ DEMO = {
 # ---------------------------------------------------------------------------------------------
 TEXTES = {
     "fr": {
-        "slogan": "Après une catastrophe naturelle : votre délai, vos dégâts, votre lettre à l'assureur, en 3 étapes.",
+        "slogan": "Ne ratez plus jamais votre délai de déclaration",
         "demo": "✨ Essayer la démo (Martigues + 3 photos)",
         "demo_aide": "Pré-remplit une commune réelle (Martigues, 13) et 3 photos d'exemple. Le sinistré est fictif.",
         "confidentialite": "🔒 **Confidentialité** : vos photos et informations personnelles ne sont jamais enregistrées sur le serveur. "
@@ -138,6 +138,7 @@ TEXTES = {
         "checklist": "Pièces à joindre ou à préparer",
         "checklist_fr": "",
         "brouillons_refuses": "{n} brouillon(s) de l'IA refusé(s) par le code avant la version finale.",
+        "version_simplifiee": "ℹ️ Version simplifiée : cette lettre a été rédigée à partir d'un modèle fixe. Relisez-la et complétez-la si besoin.",
         "cout": "Coût de cette étape : {tokens} tokens",
         "limite_analyses": "Limite atteinte : 3 analyses de commune par session (démo publique). Revenez plus tard.",
         "limite_lettres": "Limite atteinte : 2 lettres par session (démo publique). Revenez plus tard.",
@@ -169,7 +170,7 @@ TEXTES = {
         "code_source": "code source",
     },
     "en": {
-        "slogan": "After a natural disaster in France: your deadline, your damage, your claim letter, in 3 steps.",
+        "slogan": "Never miss your disaster claim deadline",
         "demo": "✨ Try the demo (Martigues + 3 photos)",
         "demo_aide": "Pre-fills a real town (Martigues, 13) and 3 sample photos. The policyholder is fictitious.",
         "confidentialite": "🔒 **Privacy**: your photos and personal details are never stored on the server. "
@@ -258,6 +259,7 @@ TEXTES = {
         "checklist": "Documents to attach or prepare",
         "checklist_fr": "In French, as your insurer will expect.",
         "brouillons_refuses": "{n} AI draft(s) rejected by the code before the final version.",
+        "version_simplifiee": "ℹ️ Simplified version: this letter was written from a fixed template. Review it and complete it if needed.",
         "cout": "Cost of this step: {tokens} tokens",
         "limite_analyses": "Limit reached: 3 town analyses per session (public demo). Please come back later.",
         "limite_lettres": "Limit reached: 2 letters per session (public demo). Please come back later.",
@@ -474,7 +476,7 @@ def df_vers_inventaire(df):
 def afficher_entete():
     col_titre, col_langue = st.columns([5, 1.3])
     with col_titre:
-        st.markdown('<h1 class="titre">🌊 CatNat Copilot</h1>', unsafe_allow_html=True)
+        st.markdown('<h1 class="titre">🌊 30 Days</h1>', unsafe_allow_html=True)
         st.markdown(f'<p class="slogan">{html.escape(t("slogan"))}</p>', unsafe_allow_html=True)
     with col_langue:
         st.radio("Langue / Language", ["fr", "en"], key="langue", horizontal=True, label_visibility="collapsed",
@@ -769,7 +771,9 @@ def etape_lettre():
                 "zone": "Pièce", "objet": "Objet", "dommage": "Dommage constaté", "certitude": "Certitude",
                 "photo": "Photo", "valeur_estimee": "Valeur estimée"}), hide_index=True, width="stretch")
             st.caption(NOTE_ANNEXE)
-        if resultat["rejets"]:
+        if resultat["secours"]:  # l'IA a échoué : lettre du modèle fixe, signalée discrètement
+            st.caption(t("version_simplifiee"))
+        elif resultat["rejets"]:
             st.caption(t("brouillons_refuses", n=len(resultat["rejets"])))
         st.caption(t("cout", tokens=resultat["tokens"]["total_tokens"]))
 
@@ -791,7 +795,7 @@ def etape_lettre():
 # ---------------------------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------------------------
-st.set_page_config(page_title="CatNat Copilot", page_icon="🌊", layout="centered")
+st.set_page_config(page_title="30 Days", page_icon="🌊", layout="centered")
 initialiser_session()
 st.markdown(CSS, unsafe_allow_html=True)
 
