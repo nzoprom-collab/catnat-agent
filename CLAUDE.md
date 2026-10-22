@@ -8,7 +8,7 @@ Piste **Best Apps and Agents**, avec le bonus **Tavily**.
 2. L'outil calcule la date limite de déclaration à l'assureur.
 3. Il rédige la lettre de déclaration, à envoyer en recommandé avec AR.
 
-**État actuel :** les étapes 1 à 5 sont terminées. Prochaine étape : l'interface.
+**État actuel :** les étapes 1 à 6 sont terminées (l'étape 6 a ajouté l'inventaire à partir des photos). Prochaine étape : l'interface.
 
 ## L'utilisateur
 
@@ -21,8 +21,10 @@ Piste **Best Apps and Agents**, avec le bonus **Tavily**.
 | Fichier | Rôle |
 |---|---|
 | `catnat.py` | Sans IA. `trouver_code_insee` (geo.api.gouv.fr), `recuperer_arretes_catnat` (API Géorisques `/api/v1/gaspar/catnat`), `calculer_delai_declaration` (date limite **prudente** = publication au JO + 29 jours ; la loi accorde 30 jours, art. L125-2 du Code des assurances), `simplifier` (enlève accents et ponctuation pour comparer des textes). |
-| `llm.py` | `appeler_nemotron(messages, modele)` : **seul point d'appel à l'IA** (Nebius Token Factory, API compatible OpenAI). Additionne les tokens dans `usage.json` et refuse l'appel au-delà de `MAX_TOKENS_TOTAL`. |
-| `lettre.py` | `generer_lettre(arrete, sinistre)` : l'IA rédige uniquement les 3 paragraphes du corps ; l'en-tête, l'objet, la politesse, « Pièce jointe » et la signature sont écrits par le code. Renvoie aussi une checklist des pièces à joindre, écrite par le code. |
+| `llm.py` | `appeler_nemotron(messages, modele, images=None)` : **seul point d'appel à l'IA** (Nebius Token Factory, API compatible OpenAI). Additionne les tokens dans `usage.json` et refuse l'appel au-delà de `MAX_TOKENS_TOTAL`. Les `images` (des chemins de fichiers) sont réduites à 1600 px maximum par `preparer_image`, puis envoyées en base64. |
+| `photos.py` | `analyser_photos(chemins)` : un appel au modèle VL par photo, qui renvoie en JSON les dommages visibles (zone, objet, dommage, certitude « certain » ou « probable, à confirmer », numéro de photo). Le code vérifie chaque ligne : champs présents, numéro de photo existant, certitude connue, aucun prix ni valeur. La colonne « valeur estimée » reste à `[À COMPLÉTER]`. `inventaire_en_tableau` produit le tableau de l'annexe. |
+| `lettre.py` | `generer_lettre(arrete, sinistre, inventaire=None)` : l'IA rédige uniquement les 3 paragraphes du corps ; l'en-tête, l'objet, la politesse, les pièces jointes, la signature et l'annexe sont écrits par le code. Avec un inventaire, le paragraphe des dégâts s'en inspire et le tableau est ajouté en annexe (« Annexe : inventaire des dommages constatés sur photos »). Renvoie aussi une checklist des pièces à joindre, écrite par le code. |
+| `exemples/` | 3 photos de test libres de droits (CC0, CC BY 2.0, CC BY 2.5), venant de Wikimedia Commons. Auteurs et licences : `exemples/CREDITS.md`. N'ajouter que des images dont la licence est claire, et mettre `CREDITS.md` à jour. |
 | `radar.py` | `rechercher_actualites(commune, departement)` : 2 recherches Tavily, fusionnées sans doublons et mises en cache 24 h dans `cache/`. `analyser_situation(...)` : l'IA classe la situation en **A** (délai en cours), **B** (arrêté annoncé, pas encore dans Géorisques), **C** (demande de reconnaissance en cours), **E** (arrêté publié, délai dépassé) ou **D** (rien de récent). Priorité : A, B, C, E, D. |
 | `hello.py` | Premier test de connexion à Nebius. Il appelle l'API directement, donc ses tokens ne sont **pas** comptés dans `usage.json`. |
 
@@ -30,6 +32,7 @@ Piste **Best Apps and Agents**, avec le bonus **Tavily**.
 - `catnat.py` : 3 communes.
 - `lettre.py` : lettre fictive pour Gif-sur-Yvette.
 - `radar.py` : Martigues, Saint-Aunès, Toulouse et Gif-sur-Yvette ; cas attendus C, C, E, D.
+- `photos.py` : inventaire des 3 photos de `exemples/`, puis lettre complète avec l'annexe (environ 14 000 tokens).
 
 **Fichiers ignorés par git** : `.env`, `.venv/`, `usage.json`, `cache/`.
 
@@ -37,6 +40,7 @@ Piste **Best Apps and Agents**, avec le bonus **Tavily**.
 
 - Base URL : `https://api.tokenfactory.nebius.com/v1`.
 - `nvidia/nemotron-3-super-120b-a12b` : lettre et radar. Plus stable que Nano, qui a été comparé au radar à l'étape 5.
+- `nvidia/Nemotron-3.5-Super-VL` : vision, utilisé pour l'inventaire photo. Il accepte les images au format OpenAI (`image_url` en base64) ; une photo de 1600 px coûte environ 3 000 à 4 000 tokens.
 - `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` : modèle par défaut de `llm.py` et de `hello.py`.
 
 Ces modèles « réfléchissent » avant de répondre : le texte entre `<think>` et `</think>` est retiré par `llm.py`.
@@ -55,6 +59,7 @@ Ces modèles « réfléchissent » avant de répondre : le texte entre `<think>`
      - B et C exigent une citation vérifiée, venant d'un site « officiel local » ou de « presse », qui nomme la commune (ou qui vient du site de cette mairie) ;
      - E exige un arrêté des 12 derniers mois dont le délai est dépassé.
    - Tous les **conseils** affichés à l'utilisateur sont écrits par le code, jamais par l'IA.
+   - **Photos** : seulement les dommages visibles et causés par l'eau, pas l'usure ancienne. Aucun prix, aucune valeur, aucune marque. L'inventaire est un brouillon que le sinistré doit relire, et l'annexe le dit.
 3. **Garde-fou de dépense** : tout appel à l'IA passe par `llm.appeler_nemotron`. Ne pas le contourner.
    - **Tavily** : 1 crédit par recherche de base, forfait de 1 000 crédits par mois. Utiliser le cache pour les tests.
 4. **Toujours relire soi-même** ce que produit l'IA avant de dire que c'est bon, et signaler honnêtement ce qui ne marche pas.
@@ -69,3 +74,4 @@ Ces modèles « réfléchissent » avant de répondre : le texte entre `<think>`
   - l'adresse `/usage` répond lentement et son compteur est en retard.
 - **Saint-Aunès** reste classée D au lieu de C : la page de la mairie n'apparaît pas toujours dans les résultats de recherche.
 - Un site de mairie au nom abrégé (par exemple `ville-gif.fr`) n'est pas reconnu comme « officiel local ».
+- **Photos** : le modèle VL exagère parfois (« cuir détrempé », « terre répandue ») tout en marquant « certain ». Le paragraphe des dégâts de la lettre reste long quand l'inventaire a beaucoup de lignes.

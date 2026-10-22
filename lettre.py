@@ -52,9 +52,12 @@ Règles absolues :
 1. Une phrase complète qui déclare le sinistre subi à {{{{ADRESSE}}}}, causé par {{{{TYPE_CATASTROPHE}}}}
    du {{{{DATE_DEBUT}}}} au {{{{DATE_FIN}}}} à {{{{COMMUNE}}}}, événement reconnu état de catastrophe
    naturelle par l'arrêté cité en objet.
-2. Une vraie phrase rédigée (avec un verbe, par exemple « Ces intempéries ont entraîné... ») qui décrit
-   les dégâts. Reprends chacun des dégâts décrits par le sinistré, sans en ajouter, sans en retirer,
-   sans les aggraver. Ne recopie pas sa description telle quelle.
+2. Des phrases rédigées (avec un verbe, par exemple « Ces intempéries ont entraîné... ») qui décrivent
+   les dégâts. Reprends chacun des dégâts fournis, sans en ajouter, sans en retirer, sans les
+   aggraver, et sans inventer de lien de cause entre eux. Ne recopie pas la liste telle quelle.
+   Si des dommages constatés sur photos sont fournis, le détail est déjà en annexe : résume-les en
+   une phrase par pièce, puis renvoie à l'annexe. Pour ceux marqués « probable, à confirmer »,
+   emploie une formulation prudente (« semble », « paraît »).
 3. « Je » tiens les justificatifs à disposition (sans les énumérer), demande la prise en charge
    au titre de la garantie catastrophes naturelles et demande le passage d'un expert pour constater
    les dommages.
@@ -136,15 +139,25 @@ def checklist_pieces(arrete_calcule, reference_arrete):
     ]
 
 
-def generer_lettre(arrete, sinistre):
+def generer_lettre(arrete, sinistre, inventaire=None):
     """Rédige la lettre de déclaration pour un arrêté CatNat (tel que renvoyé par catnat.py).
 
     `sinistre` est un dictionnaire avec les clés : nom, adresse, assureur, numero_contrat,
     description_degats. Toute information absente devient [À COMPLÉTER].
+    `inventaire` (facultatif) : lignes renvoyées par photos.analyser_photos(). Elles servent à décrire
+    les dégâts et sont ajoutées en annexe de la lettre.
     Renvoie un dictionnaire : lettre, checklist, delai_depasse, jours_restants, tokens, essais, rejets.
     """
+    # Import ici pour que lettre.py fonctionne aussi sans photos
+    from photos import inventaire_en_description, inventaire_en_tableau
+
     calcul = calculer_delai_declaration(arrete)
     description = sinistre.get("description_degats") or ""
+    if inventaire:
+        description = (description + "\n" if description else "") + (
+            "Dommages constatés sur photos (l'inventaire détaillé est joint en annexe, "
+            "tu peux le mentionner) :\n" + inventaire_en_description(inventaire)
+        )
     reference = _valeur(arrete.get("code_national_catnat"))
 
     # Les faits viennent uniquement de l'arrêté et des infos du sinistré, jamais de l'IA
@@ -167,7 +180,7 @@ def generer_lettre(arrete, sinistre):
 
     messages = [
         {"role": "system", "content": CONSIGNES},
-        {"role": "user", "content": f"Description des dégâts par le sinistré : {_valeur(description)}"},
+        {"role": "user", "content": f"Dégâts à décrire :\n{_valeur(description)}"},
     ]
     tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     rejets = []  # raisons pour lesquelles un brouillon a été refusé
@@ -203,16 +216,33 @@ def generer_lettre(arrete, sinistre):
         "Madame, Monsieur,",
         *_paragraphes(brouillon),
         "Veuillez agréer, Madame, Monsieur, l'expression de mes salutations distinguées.",
-        "Pièce jointe : copie de l'arrêté",
+        "Pièces jointes : copie de l'arrêté ; inventaire des dommages constatés sur photos (en annexe)"
+        if inventaire else "Pièce jointe : copie de l'arrêté",
         v["NOM"],
     ]
+    if inventaire:
+        blocs += [
+            "-" * 40,
+            "Annexe : inventaire des dommages constatés sur photos",
+            inventaire_en_tableau(inventaire),
+            "Inventaire établi automatiquement à partir des photos : à relire et corriger par le sinistré "
+            "avant envoi. « probable, à confirmer » : dommage qui semble visible mais doit être vérifié "
+            "par l'expert. La valeur estimée de chaque bien est à compléter par le sinistré.",
+        ]
     lettre = "\n\n".join(blocs)
     for etiquette, valeur in valeurs.items():
         lettre = lettre.replace("{{" + etiquette + "}}", valeur)
 
+    checklist = checklist_pieces(calcul, reference)
+    if inventaire:
+        checklist += [
+            "Photos originales des dégâts, numérotées comme dans l'inventaire en annexe",
+            "Colonne « valeur estimée » de l'inventaire à compléter, ligne par ligne",
+        ]
+
     return {
         "lettre": lettre,
-        "checklist": checklist_pieces(calcul, reference),
+        "checklist": checklist,
         "delai_depasse": calcul["depasse"],
         "jours_restants": calcul["jours_restants"],
         "tokens": tokens,
