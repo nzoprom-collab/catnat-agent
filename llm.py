@@ -19,7 +19,12 @@ TAILLE_MAX_IMAGE = 1600  # en pixels, pour le plus grand côté : moins de pixel
 
 
 def preparer_image(chemin, taille_max=TAILLE_MAX_IMAGE):
-    """Réduit une photo à `taille_max` pixels maximum et la renvoie au format attendu par l'API."""
+    """Réduit une photo à `taille_max` pixels maximum et la renvoie au format attendu par l'API.
+
+    `chemin` : chemin d'un fichier, ou fichier déjà ouvert en mémoire (photo envoyée depuis l'interface).
+    """
+    if hasattr(chemin, "seek"):
+        chemin.seek(0)  # un fichier en mémoire peut être relu plusieurs fois (nouvel essai)
     with Image.open(chemin) as image:
         image = ImageOps.exif_transpose(image)  # remet droites les photos de téléphone tournées
         image = image.convert("RGB")

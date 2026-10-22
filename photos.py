@@ -75,6 +75,8 @@ def verifier_ligne(ligne, numero_photo, nombre_photos):
 def analyser_photos(chemins):
     """Analyse chaque photo et renvoie l'inventaire des dommages visibles.
 
+    `chemins` : chemins de fichiers, ou fichiers déjà ouverts en mémoire (photos envoyées depuis
+    l'interface, jamais écrites sur le disque).
     Renvoie un dictionnaire : inventaire (lignes vérifiées), rejetees (lignes refusées et pourquoi),
     photos (noms des fichiers, dans l'ordre des numéros), tokens.
     """
@@ -110,14 +112,16 @@ def analyser_photos(chemins):
             else:
                 rejetees.append({"photo": numero, "ligne": ligne, "raison": raison})
 
-    return {"inventaire": inventaire, "rejetees": rejetees,
-            "photos": [Path(c).name for c in chemins], "tokens": tokens}
+    # Un fichier envoyé depuis l'interface a un attribut .name ; un simple chemin texte non
+    noms = [getattr(c, "name", None) or Path(c).name for c in chemins]
+    return {"inventaire": inventaire, "rejetees": rejetees, "photos": [Path(n).name for n in noms], "tokens": tokens}
 
 
 def inventaire_en_tableau(inventaire):
     """Tableau texte de l'inventaire (pour l'affichage et l'annexe de la lettre)."""
     entetes = ["N°", "Photo", "Zone", "Objet", "Dommage constaté", "Certitude", "Valeur estimée"]
-    lignes = [[str(i), str(l["photo"]), l["zone"], l["objet"], l["dommage"], l["certitude"], l["valeur_estimee"]]
+    # Une ligne ajoutée à la main par le sinistré n'a pas de numéro de photo : « – »
+    lignes = [[str(i), str(l["photo"] or "–"), l["zone"], l["objet"], l["dommage"], l["certitude"], l["valeur_estimee"]]
               for i, l in enumerate(inventaire, start=1)]
     largeurs = [max(len(x) for x in colonne) for colonne in zip(entetes, *lignes)]
 

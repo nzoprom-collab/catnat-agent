@@ -4,6 +4,11 @@ Règle d'or : l'IA ne recopie jamais un fait (commune, dates, noms...). Elle éc
 comme {{DATE_JO}} et c'est le code qui les remplace par les vraies valeurs. Le brouillon de l'IA
 est vérifié avant remplacement : s'il contient une date ou un chiffre inventé, il est refusé.
 L'en-tête et la fin de la lettre sont entièrement écrits par le code ; l'IA ne rédige que le corps.
+
+Deux modes :
+- avec arrêté (cas A ou E du radar) : les faits viennent de l'arrêté Géorisques ;
+- sans arrêté (cas B, C ou D) : le sinistré déclare dès maintenant ; le type et les dates de
+  l'événement sont ceux qu'il a saisis, et la lettre n'affirme jamais que l'événement est reconnu.
 """
 
 import re
@@ -16,32 +21,69 @@ MODELE_LETTRE = "nvidia/nemotron-3-super-120b-a12b"
 A_COMPLETER = "[À COMPLÉTER]"
 NOMBRE_ESSAIS = 3
 NOMBRE_PARAGRAPHES = 3
+MAX_PHRASES_DEGATS = 3
+
+# Annexe (écrite par le code) : partagée avec pdf.py et app.py
+SEPARATEUR_ANNEXE = "-" * 40
+TITRE_ANNEXE = "Annexe : inventaire des dommages constatés sur photos"
+NOTE_ANNEXE = (
+    "Inventaire établi automatiquement à partir des photos : à relire et corriger par le sinistré "
+    "avant envoi. « probable, à confirmer » : dommage qui semble visible mais doit être vérifié "
+    "par l'expert. La valeur estimée de chaque bien est à compléter par le sinistré."
+)
 
 # Étiquettes que l'IA doit obligatoirement utiliser dans le corps, puis celles qu'elle peut utiliser
 ETIQUETTES_OBLIGATOIRES = ["ADRESSE", "TYPE_CATASTROPHE", "DATE_DEBUT", "DATE_FIN", "COMMUNE"]
-ETIQUETTES_FACULTATIVES = ["DATE_JO", "REFERENCE_ARRETE", "DATE_LIMITE", "ARTICLE_LOI", "NUMERO_CONTRAT", "ASSUREUR"]
+ETIQUETTES_FACULTATIVES_SANS_ARRETE = ["ARTICLE_LOI", "NUMERO_CONTRAT", "ASSUREUR"]
+ETIQUETTES_FACULTATIVES = ["DATE_JO", "REFERENCE_ARRETE", "DATE_LIMITE"] + ETIQUETTES_FACULTATIVES_SANS_ARRETE
 
 MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
         "septembre", "octobre", "novembre", "décembre"]
 
 # Textes que le corps doit contenir mot pour mot, et ceux que le code écrit déjà lui-même
 TEXTES_OBLIGATOIRES = ["par {{TYPE_CATASTROPHE}}", "expert"]
-TEXTES_INTERDITS = ["Objet :", "Madame, Monsieur", "Veuillez agréer", "Pièce jointe", "sinistré"]
+# « énumérer » : l'IA a déjà recopié une consigne (« sans les énumérer ») dans la lettre
+TEXTES_INTERDITS = ["Objet :", "Madame, Monsieur", "Veuillez agréer", "Pièce jointe", "sinistré", "énumérer"]
+# Sans arrêté, la lettre ne doit jamais laisser croire que l'événement est déjà reconnu
+TEXTES_INTERDITS_SANS_ARRETE = ["reconnu", "arrêté cité en objet"]
 
 # Premiers mots des types Géorisques qui sont féminins, ou singuliers bien que finissant par « s »
 MOTS_FEMININS = {"sécheresse", "tempête", "crue", "submersion", "grêle", "lave", "coulée", "inondation"}
 MOTS_SINGULIERS_EN_S = {"poids", "glissement"}
 
-CONSIGNES = f"""Tu rédiges en français le corps d'une lettre de déclaration de sinistre catastrophe
+
+def _obligatoires(une_seule_date):
+    """Avec un événement d'un seul jour, {{DATE_FIN}} n'est pas utilisée (« le 20/10/2026 »)."""
+    return [e for e in ETIQUETTES_OBLIGATOIRES if not (une_seule_date and e == "DATE_FIN")]
+
+
+def _consignes(avec_arrete, une_seule_date=False):
+    """Consignes données à l'IA ; seul le premier paragraphe change selon qu'il y a un arrêté ou non."""
+    facultatives = ETIQUETTES_FACULTATIVES if avec_arrete else ETIQUETTES_FACULTATIVES_SANS_ARRETE
+    periode = "le {{DATE_DEBUT}}" if une_seule_date else "du {{DATE_DEBUT}} au {{DATE_FIN}}"
+    if avec_arrete:
+        paragraphe_1 = (
+            "Une phrase complète qui déclare le sinistre subi à {{ADRESSE}}, causé par {{TYPE_CATASTROPHE}}\n"
+            f"   {periode} à {{{{COMMUNE}}}}, événement reconnu état de catastrophe\n"
+            "   naturelle par l'arrêté cité en objet."
+        )
+    else:
+        paragraphe_1 = (
+            "Une phrase complète qui déclare le sinistre subi à {{ADRESSE}}, causé par {{TYPE_CATASTROPHE}}\n"
+            f"   {periode} à {{{{COMMUNE}}}}, et qui précise que tu le déclares dès\n"
+            "   maintenant, sans attendre la publication d'un éventuel arrêté de catastrophe naturelle.\n"
+            "   N'écris jamais que l'événement est reconnu : aucun arrêté n'est encore publié."
+        )
+    return f"""Tu rédiges en français le corps d'une lettre de déclaration de sinistre catastrophe
 naturelle, envoyée par un particulier à son assureur. L'en-tête, l'objet, « Madame, Monsieur, »,
-la formule de politesse, la pièce jointe et la signature sont ajoutés par ailleurs : ne les écris pas.
+la formule de politesse, les pièces jointes et la signature sont ajoutés par ailleurs : ne les écris pas.
 
 Règles absolues :
 - La lettre est écrite à la première personne, au nom du sinistré (« je »). N'écris jamais « le sinistré ».
 - N'écris JAMAIS toi-même une adresse, une commune, une date, une référence ou un numéro.
   Utilise à la place ces étiquettes, écrites exactement ainsi, le code les remplira :
-  {", ".join("{{" + e + "}}" for e in ETIQUETTES_OBLIGATOIRES)} (toutes obligatoires)
-  {", ".join("{{" + e + "}}" for e in ETIQUETTES_FACULTATIVES)} (facultatives ; {{{{ARTICLE_LOI}}}} = l'article du Code des assurances)
+  {", ".join("{{" + e + "}}" for e in _obligatoires(une_seule_date))} (toutes obligatoires)
+  {", ".join("{{" + e + "}}" for e in facultatives)} (facultatives ; {{{{ARTICLE_LOI}}}} = l'article du Code des assurances)
 - Aucun chiffre, aucun nom de mois. N'invente aucun montant, aucune date, aucun fait.
 - N'affirme jamais que la déclaration est faite dans les délais ou hors délai.
 - N'affirme pas ce que le sinistré possède ou a fait (photos, devis, factures, expertise...).
@@ -49,16 +91,13 @@ Règles absolues :
   toujours « causé par {{{{TYPE_CATASTROPHE}}}} », sans rien ajouter devant.
 
 Écris exactement {NOMBRE_PARAGRAPHES} paragraphes, séparés par une ligne vide :
-1. Une phrase complète qui déclare le sinistre subi à {{{{ADRESSE}}}}, causé par {{{{TYPE_CATASTROPHE}}}}
-   du {{{{DATE_DEBUT}}}} au {{{{DATE_FIN}}}} à {{{{COMMUNE}}}}, événement reconnu état de catastrophe
-   naturelle par l'arrêté cité en objet.
-2. Des phrases rédigées (avec un verbe, par exemple « Ces intempéries ont entraîné... ») qui décrivent
-   les dégâts. Reprends chacun des dégâts fournis, sans en ajouter, sans en retirer, sans les
-   aggraver, et sans inventer de lien de cause entre eux. Ne recopie pas la liste telle quelle.
-   Si des dommages constatés sur photos sont fournis, le détail est déjà en annexe : résume-les en
-   une phrase par pièce, puis renvoie à l'annexe. Pour ceux marqués « probable, à confirmer »,
-   emploie une formulation prudente (« semble », « paraît »).
-3. « Je » tiens les justificatifs à disposition (sans les énumérer), demande la prise en charge
+1. {paragraphe_1}
+2. Au maximum {MAX_PHRASES_DEGATS} phrases courtes, avec un verbe, qui RÉSUMENT les dégâts pièce par pièce
+   (par exemple « Dans le salon, ... »). Reprends les dégâts fournis sans en ajouter, sans les
+   aggraver et sans inventer de lien de cause entre eux. Ne recopie pas la liste telle quelle.
+   Pour ceux marqués « probable, à confirmer », emploie une formulation prudente (« semble »).
+   Si un inventaire est joint en annexe, termine par UN SEUL renvoi à l'annexe.
+3. « Je » tiens les justificatifs à votre disposition (ne dresse pas leur liste), demande la prise en charge
    au titre de la garantie catastrophes naturelles et demande le passage d'un expert pour constater
    les dommages.
 Réponds uniquement avec ces paragraphes, en texte brut, sans commentaire avant ou après."""
@@ -69,9 +108,16 @@ def _valeur(texte):
     return texte.strip() if texte and texte.strip() else A_COMPLETER
 
 
+def _date(valeur):
+    """Accepte une date Python ou un texte « jj/mm/aaaa » ; vide -> [À COMPLÉTER]."""
+    if isinstance(valeur, date):
+        return _format(valeur)
+    return _valeur(valeur)
+
+
 def type_avec_article(libelle):
     """« Inondations et/ou Coulées de Boue » devient « les inondations et/ou coulées de boue »."""
-    if not libelle:
+    if not libelle or not libelle.strip():
         return A_COMPLETER
     texte = libelle.strip().lower()
     premier_mot = re.split(r"[\s-]", texte)[0]
@@ -87,7 +133,7 @@ def _paragraphes(texte):
     return [ligne.strip() for ligne in texte.splitlines() if ligne.strip()]
 
 
-def verifier_brouillon(brouillon, description_degats):
+def verifier_brouillon(brouillon, description_degats, avec_arrete=True, avec_inventaire=False, une_seule_date=False):
     """Renvoie la liste des problèmes du brouillon de l'IA (liste vide = brouillon accepté)."""
     problemes = []
     # L'IA écrit parfois l'apostrophe typographique ’ : on la ramène à ' avant de comparer
@@ -95,19 +141,30 @@ def verifier_brouillon(brouillon, description_degats):
     for texte in TEXTES_OBLIGATOIRES:
         if texte not in brouillon_normalise:
             problemes.append(f"texte obligatoire absent : « {texte} »")
-    for texte in TEXTES_INTERDITS:
+    interdits = TEXTES_INTERDITS + ([] if avec_arrete else TEXTES_INTERDITS_SANS_ARRETE)
+    for texte in interdits:
         if texte in brouillon_normalise:
-            problemes.append(f"« {texte} » est déjà écrit par le code, ne l'écris pas")
+            problemes.append(f"« {texte} » ne doit pas apparaître dans le corps de la lettre")
     paragraphes = _paragraphes(brouillon)
     if len(paragraphes) != NOMBRE_PARAGRAPHES:
         problemes.append(f"{len(paragraphes)} paragraphes au lieu de {NOMBRE_PARAGRAPHES}")
-    elif description_degats and simplifier(paragraphes[1]) == simplifier(description_degats):
-        problemes.append("le paragraphe des dégâts recopie la description au lieu de la rédiger")
+    else:
+        degats = paragraphes[1]
+        if description_degats and simplifier(degats) == simplifier(description_degats):
+            problemes.append("le paragraphe des dégâts recopie la description au lieu de la rédiger")
+        nombre_phrases = len(re.findall(r"[.!?](?:\s|$)", degats))
+        if nombre_phrases > MAX_PHRASES_DEGATS:
+            problemes.append(f"le paragraphe des dégâts fait {nombre_phrases} phrases (maximum {MAX_PHRASES_DEGATS})")
+    if avec_inventaire and brouillon_normalise.lower().count("annexe") != 1:
+        problemes.append("il faut exactement un renvoi à l'annexe")
+    obligatoires = _obligatoires(une_seule_date)
+    autorisees = set(ETIQUETTES_OBLIGATOIRES) | set(
+        ETIQUETTES_FACULTATIVES if avec_arrete else ETIQUETTES_FACULTATIVES_SANS_ARRETE)
     trouvees = set(re.findall(r"\{\{([A-Z_]+)\}\}", brouillon))
-    inconnues = trouvees - set(ETIQUETTES_OBLIGATOIRES) - set(ETIQUETTES_FACULTATIVES)
+    inconnues = trouvees - autorisees
     if inconnues:
-        problemes.append(f"étiquettes inconnues : {', '.join(sorted(inconnues))}")
-    manquantes = set(ETIQUETTES_OBLIGATOIRES) - trouvees
+        problemes.append(f"étiquettes non autorisées : {', '.join(sorted(inconnues))}")
+    manquantes = set(obligatoires) - trouvees
     if manquantes:
         problemes.append(f"étiquettes obligatoires manquantes : {', '.join(sorted(manquantes))}")
     # Seuls les chiffres déjà présents dans la description du sinistré sont autorisés
@@ -124,10 +181,15 @@ def verifier_brouillon(brouillon, description_degats):
 
 def checklist_pieces(arrete_calcule, reference_arrete):
     """Liste des pièces à joindre ou à préparer (fixe, écrite par le code et non par l'IA)."""
+    if arrete_calcule:
+        piece_arrete = (f"Copie de l'arrêté CatNat {reference_arrete}, publié au JO le "
+                        f"{_format(arrete_calcule['publication_jo'])} (à joindre, disponible sur legifrance.gouv.fr)")
+    else:
+        piece_arrete = ("Surveiller la publication de l'arrêté CatNat au Journal officiel (legifrance.gouv.fr) : "
+                        "la déclaration doit parvenir à l'assureur au plus tard 30 jours après cette publication")
     return [
         "Preuve de dépôt du recommandé et copie de cette lettre (à conserver)",
-        f"Copie de l'arrêté CatNat {reference_arrete}, publié au JO le "
-        f"{_format(arrete_calcule['publication_jo'])} (à joindre, disponible sur legifrance.gouv.fr)",
+        piece_arrete,
         "Photos et vidéos des dégâts (si possible avant tout nettoyage)",
         "Liste détaillée des biens endommagés, avec leur valeur estimée",
         "Factures d'achat, garanties ou tout justificatif de la valeur des biens",
@@ -140,25 +202,28 @@ def checklist_pieces(arrete_calcule, reference_arrete):
 
 
 def generer_lettre(arrete, sinistre, inventaire=None):
-    """Rédige la lettre de déclaration pour un arrêté CatNat (tel que renvoyé par catnat.py).
+    """Rédige la lettre de déclaration de sinistre.
 
-    `sinistre` est un dictionnaire avec les clés : nom, adresse, assureur, numero_contrat,
-    description_degats. Toute information absente devient [À COMPLÉTER].
-    `inventaire` (facultatif) : lignes renvoyées par photos.analyser_photos(). Elles servent à décrire
-    les dégâts et sont ajoutées en annexe de la lettre.
+    `arrete` : arrêté CatNat tel que renvoyé par catnat.py, ou None s'il n'y en a pas encore.
+    `sinistre` : dictionnaire avec les clés nom, adresse, assureur, adresse_assureur, numero_contrat,
+    description_degats ; et, sans arrêté : commune, type_evenement, date_debut, date_fin.
+    Toute information absente devient [À COMPLÉTER].
+    `inventaire` (facultatif) : lignes renvoyées par photos.analyser_photos() (éventuellement
+    corrigées par le sinistré). Elles servent à décrire les dégâts et sont ajoutées en annexe.
     Renvoie un dictionnaire : lettre, checklist, delai_depasse, jours_restants, tokens, essais, rejets.
     """
     # Import ici pour que lettre.py fonctionne aussi sans photos
     from photos import inventaire_en_description, inventaire_en_tableau
 
-    calcul = calculer_delai_declaration(arrete)
+    avec_arrete = arrete is not None
+    calcul = calculer_delai_declaration(arrete) if avec_arrete else None
     description = sinistre.get("description_degats") or ""
     if inventaire:
         description = (description + "\n" if description else "") + (
-            "Dommages constatés sur photos (l'inventaire détaillé est joint en annexe, "
-            "tu peux le mentionner) :\n" + inventaire_en_description(inventaire)
+            "Dommages constatés sur photos (l'inventaire détaillé est joint en annexe) :\n"
+            + inventaire_en_description(inventaire)
         )
-    reference = _valeur(arrete.get("code_national_catnat"))
+    reference = _valeur(arrete.get("code_national_catnat")) if avec_arrete else A_COMPLETER
 
     # Les faits viennent uniquement de l'arrêté et des infos du sinistré, jamais de l'IA
     valeurs = {
@@ -167,19 +232,31 @@ def generer_lettre(arrete, sinistre, inventaire=None):
         "ASSUREUR": _valeur(sinistre.get("assureur")),
         "ADRESSE_ASSUREUR": _valeur(sinistre.get("adresse_assureur")),
         "NUMERO_CONTRAT": _valeur(sinistre.get("numero_contrat")),
-        "COMMUNE": _valeur(arrete.get("libelle_commune")),
-        "TYPE_CATASTROPHE": type_avec_article(calcul["type"]),
-        "DATE_DEBUT": _valeur(calcul["debut_evenement"] and _format(calcul["debut_evenement"])),
-        "DATE_FIN": _valeur(calcul["fin_evenement"] and _format(calcul["fin_evenement"])),
-        "DATE_JO": _valeur(calcul["publication_jo"] and _format(calcul["publication_jo"])),
-        "DATE_LIMITE": _valeur(calcul["date_limite"] and _format(calcul["date_limite"])),
-        "REFERENCE_ARRETE": reference,
         "ARTICLE_LOI": "L125-2 du Code des assurances",
         "DATE_DU_JOUR": _format(date.today()),
+        "REFERENCE_ARRETE": reference,
     }
+    if avec_arrete:
+        valeurs.update({
+            "COMMUNE": _valeur(arrete.get("libelle_commune")),
+            "TYPE_CATASTROPHE": type_avec_article(calcul["type"]),
+            "DATE_DEBUT": _date(calcul["debut_evenement"]),
+            "DATE_FIN": _date(calcul["fin_evenement"]),
+            "DATE_JO": _date(calcul["publication_jo"]),
+            "DATE_LIMITE": _date(calcul["date_limite"]),
+        })
+    else:
+        date_debut = sinistre.get("date_debut")
+        valeurs.update({
+            "COMMUNE": _valeur(sinistre.get("commune")),
+            "TYPE_CATASTROPHE": type_avec_article(sinistre.get("type_evenement")),
+            "DATE_DEBUT": _date(date_debut),
+            "DATE_FIN": _date(sinistre.get("date_fin") or date_debut),
+        })
 
+    une_seule_date = valeurs["DATE_DEBUT"] == valeurs["DATE_FIN"]
     messages = [
-        {"role": "system", "content": CONSIGNES},
+        {"role": "system", "content": _consignes(avec_arrete, une_seule_date)},
         {"role": "user", "content": f"Dégâts à décrire :\n{_valeur(description)}"},
     ]
     tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -191,7 +268,7 @@ def generer_lettre(arrete, sinistre, inventaire=None):
         )
         for cle in tokens:
             tokens[cle] += tokens_appel[cle]
-        problemes = verifier_brouillon(brouillon, description)
+        problemes = verifier_brouillon(brouillon, description, avec_arrete, bool(inventaire), une_seule_date)
         if not problemes:
             break
         rejets.append(" ; ".join(problemes))
@@ -206,29 +283,30 @@ def generer_lettre(arrete, sinistre, inventaire=None):
 
     # En-tête et fin de lettre : écrits par le code, avec une ligne vide entre chaque bloc
     v = valeurs
+    if avec_arrete:
+        objet = (f"Objet : Déclaration de sinistre catastrophe naturelle – arrêté {v['REFERENCE_ARRETE']} "
+                 f"publié au Journal officiel du {v['DATE_JO']} – contrat {v['NUMERO_CONTRAT']}")
+    else:
+        periode = v["DATE_DEBUT"] if une_seule_date else f"{v['DATE_DEBUT']} au {v['DATE_FIN']}"
+        objet = (f"Objet : Déclaration de sinistre – événement du {periode} à {v['COMMUNE']} "
+                 f"– contrat {v['NUMERO_CONTRAT']}")
+    pieces = (["copie de l'arrêté"] if avec_arrete else []) + (
+        ["inventaire des dommages constatés sur photos (en annexe)"] if inventaire else [])
     blocs = [
         f"{v['NOM']}\n{v['ADRESSE']}",
         f"{v['ASSUREUR']}\n{v['ADRESSE_ASSUREUR']}",
         "Lettre recommandée avec accusé de réception",
         f"{v['COMMUNE']}, le {v['DATE_DU_JOUR']}",
-        f"Objet : Déclaration de sinistre catastrophe naturelle – arrêté {v['REFERENCE_ARRETE']} "
-        f"publié au Journal officiel du {v['DATE_JO']} – contrat {v['NUMERO_CONTRAT']}",
+        objet,
         "Madame, Monsieur,",
         *_paragraphes(brouillon),
         "Veuillez agréer, Madame, Monsieur, l'expression de mes salutations distinguées.",
-        "Pièces jointes : copie de l'arrêté ; inventaire des dommages constatés sur photos (en annexe)"
-        if inventaire else "Pièce jointe : copie de l'arrêté",
-        v["NOM"],
     ]
+    if pieces:
+        blocs.append(("Pièces jointes : " if len(pieces) > 1 else "Pièce jointe : ") + " ; ".join(pieces))
+    blocs.append(v["NOM"])
     if inventaire:
-        blocs += [
-            "-" * 40,
-            "Annexe : inventaire des dommages constatés sur photos",
-            inventaire_en_tableau(inventaire),
-            "Inventaire établi automatiquement à partir des photos : à relire et corriger par le sinistré "
-            "avant envoi. « probable, à confirmer » : dommage qui semble visible mais doit être vérifié "
-            "par l'expert. La valeur estimée de chaque bien est à compléter par le sinistré.",
-        ]
+        blocs += [SEPARATEUR_ANNEXE, TITRE_ANNEXE, inventaire_en_tableau(inventaire), NOTE_ANNEXE]
     lettre = "\n\n".join(blocs)
     for etiquette, valeur in valeurs.items():
         lettre = lettre.replace("{{" + etiquette + "}}", valeur)
@@ -243,8 +321,8 @@ def generer_lettre(arrete, sinistre, inventaire=None):
     return {
         "lettre": lettre,
         "checklist": checklist,
-        "delai_depasse": calcul["depasse"],
-        "jours_restants": calcul["jours_restants"],
+        "delai_depasse": calcul["depasse"] if calcul else None,
+        "jours_restants": calcul["jours_restants"] if calcul else None,
         "tokens": tokens,
         "essais": essai,
         "rejets": rejets,

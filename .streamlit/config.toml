@@ -1,0 +1,16 @@
+[theme]
+base = "light"
+primaryColor = "#1f5fa8"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f6f9"
+textColor = "#1f2933"
+font = "sans serif"
+
+[server]
+maxUploadSize = 15  # Mo par photo
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"  # cache le bouton « Deploy »

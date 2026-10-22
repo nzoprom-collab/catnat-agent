@@ -12,3 +12,6 @@ usage.json
 
 # Cache des recherches web (24 h)
 cache/
+
+# Secrets Streamlit (pour un futur déploiement)
+.streamlit/secrets.toml
