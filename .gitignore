@@ -1,0 +1,8 @@
+# Secrets (clé API) : ne jamais publier
+.env
+
+# Environnement virtuel Python
+.venv/
+
+# Fichiers temporaires Python
+__pycache__/
