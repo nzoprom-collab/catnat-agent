@@ -6,3 +6,6 @@
 
 # Fichiers temporaires Python
 __pycache__/
+
+# Compteur de tokens (propre à chaque machine)
+usage.json

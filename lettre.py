@@ -1,0 +1,199 @@
+"""Lettre de déclaration de sinistre catastrophe naturelle, rédigée par Nemotron.
+
+Règle d'or : l'IA ne recopie jamais un fait (commune, dates, noms...). Elle écrit des étiquettes
+comme {{DATE_JO}} et c'est le code qui les remplace par les vraies valeurs. Le brouillon de l'IA
+est vérifié avant remplacement : s'il contient une date ou un chiffre inventé, il est refusé.
+"""
+
+import re
+from datetime import date
+
+from catnat import _format, calculer_delai_declaration
+from llm import appeler_nemotron
+
+MODELE_LETTRE = "nvidia/nemotron-3-super-120b-a12b"
+A_COMPLETER = "[À COMPLÉTER]"
+NOMBRE_ESSAIS = 3
+
+# Étiquettes que l'IA doit obligatoirement utiliser, puis celles qu'elle peut utiliser
+ETIQUETTES_OBLIGATOIRES = [
+    "NOM", "ADRESSE", "ASSUREUR", "ADRESSE_ASSUREUR", "NUMERO_CONTRAT", "COMMUNE",
+    "TYPE_CATASTROPHE", "DATE_DEBUT", "DATE_FIN", "DATE_JO", "REFERENCE_ARRETE", "DATE_DU_JOUR",
+]
+ETIQUETTES_FACULTATIVES = ["DATE_LIMITE", "ARTICLE_LOI"]
+
+MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
+        "septembre", "octobre", "novembre", "décembre"]
+
+CONSIGNES = f"""Tu rédiges en français une lettre de déclaration de sinistre catastrophe naturelle,
+envoyée par un particulier à son assureur en lettre recommandée avec accusé de réception.
+
+Règles absolues :
+- N'écris JAMAIS toi-même un nom, une adresse, une commune, une date, une référence ou un numéro.
+  Utilise à la place ces étiquettes, écrites exactement ainsi, le code les remplira :
+  {", ".join("{{" + e + "}}" for e in ETIQUETTES_OBLIGATOIRES)} (toutes obligatoires)
+  {", ".join("{{" + e + "}}" for e in ETIQUETTES_FACULTATIVES)} (facultatives ; {{{{ARTICLE_LOI}}}} = l'article du Code des assurances)
+- Aucun chiffre dans ta lettre, aucun nom de mois. N'invente aucun montant, aucune date, aucun fait.
+- Pour les dégâts, reformule uniquement ceux décrits par le sinistré, sans en ajouter.
+- N'affirme jamais que la déclaration est faite dans les délais ou hors délai.
+- N'affirme pas ce que le sinistré possède ou a fait (photos, devis, factures, expertise...).
+  Écris seulement qu'il tient les justificatifs à disposition, sans les énumérer, et qu'il
+  demande la prise en charge au titre de la garantie catastrophes naturelles.
+- Mise en page : expéditeur, destinataire ({{{{ASSUREUR}}}} puis {{{{ADRESSE_ASSUREUR}}}}), mention
+  « Lettre recommandée avec accusé de réception », lieu et date ({{{{COMMUNE}}}}, {{{{DATE_DU_JOUR}}}}),
+  puis cette ligne d'objet, recopiée telle quelle sur une seule ligne et sans guillemets :
+  Objet : Déclaration de sinistre catastrophe naturelle – arrêté {{{{REFERENCE_ARRETE}}}} publié au Journal officiel du {{{{DATE_JO}}}} – contrat {{{{NUMERO_CONTRAT}}}}
+  puis le corps de la lettre, la formule de politesse et la signature ({{{{NOM}}}}).
+- Le premier paragraphe est une phrase complète qui déclare le sinistre subi à {{{{ADRESSE}}}}
+  lors de l'événement {{{{TYPE_CATASTROPHE}}}} survenu du {{{{DATE_DEBUT}}}} au {{{{DATE_FIN}}}}
+  à {{{{COMMUNE}}}}, reconnu état de catastrophe naturelle par l'arrêté cité en objet.
+  Le deuxième décrit les dégâts. Le troisième demande la prise en charge.
+- Réponds uniquement avec la lettre, en texte brut, sans commentaire avant ou après."""
+
+
+def _valeur(texte):
+    """Une information vide devient [À COMPLÉTER]."""
+    return texte.strip() if texte and texte.strip() else A_COMPLETER
+
+
+def verifier_brouillon(brouillon, description_degats):
+    """Renvoie la liste des problèmes du brouillon de l'IA (liste vide = brouillon accepté)."""
+    problemes = []
+    trouvees = set(re.findall(r"\{\{([A-Z_]+)\}\}", brouillon))
+    inconnues = trouvees - set(ETIQUETTES_OBLIGATOIRES) - set(ETIQUETTES_FACULTATIVES)
+    if inconnues:
+        problemes.append(f"étiquettes inconnues : {', '.join(sorted(inconnues))}")
+    manquantes = set(ETIQUETTES_OBLIGATOIRES) - trouvees
+    if manquantes:
+        problemes.append(f"étiquettes obligatoires manquantes : {', '.join(sorted(manquantes))}")
+    # Seuls les chiffres déjà présents dans la description du sinistré sont autorisés
+    chiffres_inventes = set(re.findall(r"\d+", brouillon)) - set(re.findall(r"\d+", description_degats))
+    if chiffres_inventes:
+        problemes.append(f"chiffres écrits par l'IA : {', '.join(sorted(chiffres_inventes))}")
+    mois_inventes = [m for m in MOIS
+                     if re.search(rf"\b{m}\b", brouillon, re.IGNORECASE)
+                     and not re.search(rf"\b{m}\b", description_degats, re.IGNORECASE)]
+    if mois_inventes:
+        problemes.append(f"noms de mois écrits par l'IA : {', '.join(mois_inventes)}")
+    return problemes
+
+
+def checklist_pieces(arrete_calcule, reference_arrete):
+    """Liste des pièces à joindre ou à préparer (fixe, écrite par le code et non par l'IA)."""
+    return [
+        "Preuve de dépôt du recommandé et copie de cette lettre (à conserver)",
+        f"Référence de l'arrêté CatNat : {reference_arrete}, publié au JO le "
+        f"{_format(arrete_calcule['publication_jo'])}",
+        "Photos et vidéos des dégâts (si possible avant tout nettoyage)",
+        "Liste détaillée des biens endommagés, avec leur valeur estimée",
+        "Factures d'achat, garanties ou tout justificatif de la valeur des biens",
+        "Devis ou factures de réparation et de remplacement",
+        "Attestation d'un professionnel pour les équipements hors service",
+        "Conserver les biens endommagés jusqu'au passage de l'expert",
+        "Copie du contrat d'assurance habitation (conditions particulières)",
+        "RIB pour le versement de l'indemnisation",
+    ]
+
+
+def generer_lettre(arrete, sinistre):
+    """Rédige la lettre de déclaration pour un arrêté CatNat (tel que renvoyé par catnat.py).
+
+    `sinistre` est un dictionnaire avec les clés : nom, adresse, assureur, numero_contrat,
+    description_degats. Toute information absente devient [À COMPLÉTER].
+    Renvoie un dictionnaire : lettre, checklist, delai_depasse, jours_restants, tokens, essais, rejets.
+    """
+    calcul = calculer_delai_declaration(arrete)
+    description = sinistre.get("description_degats") or ""
+    reference = _valeur(arrete.get("code_national_catnat"))
+
+    # Les faits viennent uniquement de l'arrêté et des infos du sinistré, jamais de l'IA
+    valeurs = {
+        "NOM": _valeur(sinistre.get("nom")),
+        "ADRESSE": _valeur(sinistre.get("adresse")),
+        "ASSUREUR": _valeur(sinistre.get("assureur")),
+        "ADRESSE_ASSUREUR": _valeur(sinistre.get("adresse_assureur")),
+        "NUMERO_CONTRAT": _valeur(sinistre.get("numero_contrat")),
+        "COMMUNE": _valeur(arrete.get("libelle_commune")),
+        "TYPE_CATASTROPHE": _valeur(calcul["type"]),
+        "DATE_DEBUT": _valeur(calcul["debut_evenement"] and _format(calcul["debut_evenement"])),
+        "DATE_FIN": _valeur(calcul["fin_evenement"] and _format(calcul["fin_evenement"])),
+        "DATE_JO": _valeur(calcul["publication_jo"] and _format(calcul["publication_jo"])),
+        "DATE_LIMITE": _valeur(calcul["date_limite"] and _format(calcul["date_limite"])),
+        "REFERENCE_ARRETE": reference,
+        "ARTICLE_LOI": "L125-2 du Code des assurances",
+        "DATE_DU_JOUR": _format(date.today()),
+    }
+
+    messages = [
+        {"role": "system", "content": CONSIGNES},
+        {"role": "user", "content": f"Description des dégâts par le sinistré : {_valeur(description)}"},
+    ]
+    tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    rejets = []  # raisons pour lesquelles un brouillon a été refusé
+
+    for essai in range(1, NOMBRE_ESSAIS + 1):
+        brouillon, tokens_appel = appeler_nemotron(
+            messages, modele=MODELE_LETTRE, temperature=0.3, max_tokens=6000
+        )
+        for cle in tokens:
+            tokens[cle] += tokens_appel[cle]
+        problemes = verifier_brouillon(brouillon, description)
+        if not problemes:
+            break
+        rejets.append(" ; ".join(problemes))
+        # On renvoie ses erreurs à l'IA pour qu'elle corrige
+        messages += [
+            {"role": "assistant", "content": brouillon},
+            {"role": "user", "content": "Ta lettre ne respecte pas les règles : " + " ; ".join(problemes)
+                                        + ". Réécris la lettre complète en corrigeant ces points."},
+        ]
+    else:
+        raise ValueError(f"Lettre refusée après {NOMBRE_ESSAIS} essais : {' ; '.join(problemes)}")
+
+    lettre = brouillon
+    for etiquette, valeur in valeurs.items():
+        lettre = lettre.replace("{{" + etiquette + "}}", valeur)
+
+    return {
+        "lettre": lettre,
+        "checklist": checklist_pieces(calcul, reference),
+        "delai_depasse": calcul["depasse"],
+        "jours_restants": calcul["jours_restants"],
+        "tokens": tokens,
+        "essais": essai,
+        "rejets": rejets,
+    }
+
+
+if __name__ == "__main__":
+    from catnat import recuperer_arretes_catnat, trouver_code_insee
+
+    code_insee, _ = trouver_code_insee("Gif-sur-Yvette", "91190")
+    arrete = next(
+        a for a in recuperer_arretes_catnat(code_insee)
+        if a["date_publication_jo"] == "04/11/2024" and "Inondation" in a["libelle_risque_jo"]
+    )
+    # Sinistré FICTIF, pour le test uniquement
+    sinistre = {
+        "nom": "Camille Exemple",
+        "adresse": "1 rue Fictive, 91190 Gif-sur-Yvette",
+        "assureur": "Assurance Fictive",
+        "numero_contrat": "TEST-0000",
+        "description_degats": "Cave inondée, chaudière et machine à laver hors service.",
+    }
+
+    resultat = generer_lettre(arrete, sinistre)
+
+    print("=" * 70)
+    print(resultat["lettre"])
+    print("=" * 70)
+    print("\nPièces à joindre / à préparer :")
+    for piece in resultat["checklist"]:
+        print(f"  [ ] {piece}")
+    for numero, raison in enumerate(resultat["rejets"], start=1):
+        print(f"\nBrouillon n°{numero} refusé par la vérification : {raison}")
+    if resultat["delai_depasse"]:
+        print(f"\nATTENTION : délai de déclaration dépassé depuis {-resultat['jours_restants']} jours.")
+    t = resultat["tokens"]
+    print(f"\nTokens consommés : {t['prompt_tokens']} (consignes) + {t['completion_tokens']} (lettre)"
+          f" = {t['total_tokens']} au total, en {resultat['essais']} essai(s)")
