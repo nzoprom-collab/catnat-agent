@@ -25,6 +25,18 @@ ETIQUETTES_FACULTATIVES = ["DATE_LIMITE", "ARTICLE_LOI"]
 MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
         "septembre", "octobre", "novembre", "décembre"]
 
+# Textes que la lettre doit contenir mot pour mot
+TEXTES_OBLIGATOIRES = [
+    "Madame, Monsieur,",
+    "par {{TYPE_CATASTROPHE}}",
+    "expert",
+    "Pièce jointe : copie de l'arrêté",
+]
+
+# Premiers mots des types Géorisques qui sont féminins, ou singuliers bien que finissant par « s »
+MOTS_FEMININS = {"sécheresse", "tempête", "crue", "submersion", "grêle", "lave", "coulée", "inondation"}
+MOTS_SINGULIERS_EN_S = {"poids", "glissement"}
+
 CONSIGNES = f"""Tu rédiges en français une lettre de déclaration de sinistre catastrophe naturelle,
 envoyée par un particulier à son assureur en lettre recommandée avec accusé de réception.
 
@@ -37,17 +49,24 @@ Règles absolues :
 - Pour les dégâts, reformule uniquement ceux décrits par le sinistré, sans en ajouter.
 - N'affirme jamais que la déclaration est faite dans les délais ou hors délai.
 - N'affirme pas ce que le sinistré possède ou a fait (photos, devis, factures, expertise...).
-  Écris seulement qu'il tient les justificatifs à disposition, sans les énumérer, et qu'il
-  demande la prise en charge au titre de la garantie catastrophes naturelles.
-- Mise en page : expéditeur, destinataire ({{{{ASSUREUR}}}} puis {{{{ADRESSE_ASSUREUR}}}}), mention
-  « Lettre recommandée avec accusé de réception », lieu et date ({{{{COMMUNE}}}}, {{{{DATE_DU_JOUR}}}}),
-  puis cette ligne d'objet, recopiée telle quelle sur une seule ligne et sans guillemets :
+- {{{{TYPE_CATASTROPHE}}}} contient déjà son article (exemple : « les inondations ») : écris
+  toujours « causé par {{{{TYPE_CATASTROPHE}}}} », sans rien ajouter devant.
+- Mise en page, dans cet ordre :
+  expéditeur ; destinataire ({{{{ASSUREUR}}}} puis {{{{ADRESSE_ASSUREUR}}}}) ;
+  « Lettre recommandée avec accusé de réception » ; lieu et date ({{{{COMMUNE}}}}, le {{{{DATE_DU_JOUR}}}}) ;
+  cette ligne d'objet, recopiée telle quelle sur une seule ligne et sans guillemets :
   Objet : Déclaration de sinistre catastrophe naturelle – arrêté {{{{REFERENCE_ARRETE}}}} publié au Journal officiel du {{{{DATE_JO}}}} – contrat {{{{NUMERO_CONTRAT}}}}
-  puis le corps de la lettre, la formule de politesse et la signature ({{{{NOM}}}}).
-- Le premier paragraphe est une phrase complète qui déclare le sinistre subi à {{{{ADRESSE}}}}
-  lors de l'événement {{{{TYPE_CATASTROPHE}}}} survenu du {{{{DATE_DEBUT}}}} au {{{{DATE_FIN}}}}
-  à {{{{COMMUNE}}}}, reconnu état de catastrophe naturelle par l'arrêté cité en objet.
-  Le deuxième décrit les dégâts. Le troisième demande la prise en charge.
+  la ligne « Madame, Monsieur, » seule ;
+  premier paragraphe : une phrase complète qui déclare le sinistre subi à {{{{ADRESSE}}}}, causé par
+  {{{{TYPE_CATASTROPHE}}}} du {{{{DATE_DEBUT}}}} au {{{{DATE_FIN}}}} à {{{{COMMUNE}}}}, événement reconnu
+  état de catastrophe naturelle par l'arrêté cité en objet ;
+  deuxième paragraphe : les dégâts ;
+  troisième paragraphe : le sinistré tient les justificatifs à disposition (sans les énumérer),
+  demande la prise en charge au titre de la garantie catastrophes naturelles et demande le
+  passage d'un expert pour constater les dommages ;
+  formule de politesse ;
+  la ligne « Pièce jointe : copie de l'arrêté » seule ;
+  signature ({{{{NOM}}}}).
 - Réponds uniquement avec la lettre, en texte brut, sans commentaire avant ou après."""
 
 
@@ -56,9 +75,27 @@ def _valeur(texte):
     return texte.strip() if texte and texte.strip() else A_COMPLETER
 
 
+def type_avec_article(libelle):
+    """« Inondations et/ou Coulées de Boue » devient « les inondations et/ou coulées de boue »."""
+    if not libelle:
+        return A_COMPLETER
+    texte = libelle.strip().lower()
+    premier_mot = re.split(r"[\s-]", texte)[0]
+    if premier_mot.endswith(("s", "x")) and premier_mot not in MOTS_SINGULIERS_EN_S:
+        return "les " + texte
+    if premier_mot[0] in "aàâeéèêiîoôuûyh":
+        return "l'" + texte
+    return ("la " if premier_mot in MOTS_FEMININS else "le ") + texte
+
+
 def verifier_brouillon(brouillon, description_degats):
     """Renvoie la liste des problèmes du brouillon de l'IA (liste vide = brouillon accepté)."""
     problemes = []
+    # L'IA écrit parfois l'apostrophe typographique ’ : on la ramène à ' avant de comparer
+    brouillon_normalise = brouillon.replace("’", "'")
+    for texte in TEXTES_OBLIGATOIRES:
+        if texte not in brouillon_normalise:
+            problemes.append(f"texte obligatoire absent : « {texte} »")
     trouvees = set(re.findall(r"\{\{([A-Z_]+)\}\}", brouillon))
     inconnues = trouvees - set(ETIQUETTES_OBLIGATOIRES) - set(ETIQUETTES_FACULTATIVES)
     if inconnues:
@@ -82,8 +119,8 @@ def checklist_pieces(arrete_calcule, reference_arrete):
     """Liste des pièces à joindre ou à préparer (fixe, écrite par le code et non par l'IA)."""
     return [
         "Preuve de dépôt du recommandé et copie de cette lettre (à conserver)",
-        f"Référence de l'arrêté CatNat : {reference_arrete}, publié au JO le "
-        f"{_format(arrete_calcule['publication_jo'])}",
+        f"Copie de l'arrêté CatNat {reference_arrete}, publié au JO le "
+        f"{_format(arrete_calcule['publication_jo'])} (à joindre, disponible sur legifrance.gouv.fr)",
         "Photos et vidéos des dégâts (si possible avant tout nettoyage)",
         "Liste détaillée des biens endommagés, avec leur valeur estimée",
         "Factures d'achat, garanties ou tout justificatif de la valeur des biens",
@@ -114,7 +151,7 @@ def generer_lettre(arrete, sinistre):
         "ADRESSE_ASSUREUR": _valeur(sinistre.get("adresse_assureur")),
         "NUMERO_CONTRAT": _valeur(sinistre.get("numero_contrat")),
         "COMMUNE": _valeur(arrete.get("libelle_commune")),
-        "TYPE_CATASTROPHE": _valeur(calcul["type"]),
+        "TYPE_CATASTROPHE": type_avec_article(calcul["type"]),
         "DATE_DEBUT": _valeur(calcul["debut_evenement"] and _format(calcul["debut_evenement"])),
         "DATE_FIN": _valeur(calcul["fin_evenement"] and _format(calcul["fin_evenement"])),
         "DATE_JO": _valeur(calcul["publication_jo"] and _format(calcul["publication_jo"])),

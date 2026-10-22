@@ -12,11 +12,13 @@ GEORISQUES_CATNAT_API = "https://georisques.gouv.fr/api/v1/gaspar/catnat"
 DELAI_PRUDENT_JOURS = 29
 
 
-def trouver_code_insee(nom_commune, code_postal=None):
+def trouver_code_insee(nom_commune, code_postal=None, code_departement=None):
     """Renvoie (code INSEE, nom officiel) d'une commune, via geo.api.gouv.fr."""
     params = {"nom": nom_commune, "fields": "nom,code", "boost": "population"}
     if code_postal:
         params["codePostal"] = code_postal
+    if code_departement:
+        params["codeDepartement"] = code_departement
     reponse = requests.get(GEO_API, params=params, timeout=20)
     reponse.raise_for_status()
     communes = reponse.json()
